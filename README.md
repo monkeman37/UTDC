@@ -45,7 +45,7 @@ show Dreamcast buttons instead of keyboard keys. This is done by swapping
 those text strings at load time (`runner/src/dreamcast/dc_text_patches.c`);
 no game scripts are modified.
 
-Saves go to the first VMU found (one file, ~2 blocks, shows as "UNDERTALE DC").
+Saves go to the first VMU found (two alternating save files, ~2 blocks each, shown as "UNDERTALE DC"; the newest valid one is loaded, so switching off mid-save can't lose your previous save).
 Writes happen in the background, so saving never stalls the game.
 
 ## What the wizard does

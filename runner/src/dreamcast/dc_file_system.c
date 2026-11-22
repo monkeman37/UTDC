@@ -16,7 +16,8 @@
 #include "miniz.h"
 #include "stb_ds.h"
 
-#define SAVE_NAME "UTDC_SAV"
+#define SAVE_NAME_A "UTDC_SV1"
+#define SAVE_NAME_B "UTDC_SV2"
 #define SAVE_MAGIC 0x53445455u /* "UTDS" */
 #define FLUSH_DELAY_MS 1500
 
@@ -52,6 +53,8 @@ typedef struct {
     int jobSize;
     volatile bool busy;
     volatile bool writeFailed;
+    uint32_t seq;          /* sequence number of the newest save */
+    int lastSlot;          /* slot (0/1) holding that save, -1 if none */
 } DcFs;
 
 /* ------------------------------------------------------------------ */
@@ -112,13 +115,13 @@ static bool readDisc(DcFs* fs, const char* rel, uint8_t** out, int32_t* outSize)
 /* VMU persistence                                                     */
 /* ------------------------------------------------------------------ */
 
-static maple_device_t* findVmu(char* outPath, size_t n) {
-    for (int i = 0; ; i++) {
-        maple_device_t* dev = maple_enum_type(i, MAPLE_FUNC_MEMCARD);
-        if (!dev) return nullptr;
-        snprintf(outPath, n, "/vmu/%c%d/%s", 'a' + dev->port, dev->unit, SAVE_NAME);
-        return dev;
-    }
+/* Two save slots are written alternately, each carrying a sequence number, so a write that is
+   interrupted (power off, VMU pulled) never destroys the previous good save. */
+static maple_device_t* findVmu(char* outDir, size_t n) {
+    maple_device_t* dev = maple_enum_type(0, MAPLE_FUNC_MEMCARD);
+    if (!dev) return nullptr;
+    snprintf(outDir, n, "/vmu/%c%d", 'a' + dev->port, dev->unit);
+    return dev;
 }
 
 static void buildIcon(vmu_pkg_t* pkg, uint8_t* iconData) {
@@ -156,15 +159,18 @@ static void* vmuWriter(void* p) {
         mutex_unlock(&fs->jobLock);
         if (!data) { fs->busy = false; continue; }
         uint64_t t0 = timer_ms_gettime64();
-        char path[64];
+        char dir[32], path[64];
         bool ok = false;
-        if (findVmu(path, sizeof path)) {
+        if (findVmu(dir, sizeof dir)) {
+            int slot = fs->lastSlot == 0 ? 1 : 0;   /* never overwrite the newest good save */
+            snprintf(path, sizeof path, "%s/%s", dir, slot == 0 ? SAVE_NAME_A : SAVE_NAME_B);
             fs_unlink(path);
             file_t f = fs_open(path, O_WRONLY | O_CREAT | O_TRUNC);
             if (f != FILEHND_INVALID) {
                 ok = fs_write(f, data, (size_t) size) == size;
                 fs_close(f);
             }
+            if (ok) fs->lastSlot = slot;
             if (ok) snprintf(fs->status, sizeof fs->status, "Saved to VMU (%d blocks)", (size + 511) / 512);
             else snprintf(fs->status, sizeof fs->status, "VMU write failed (full?) - need %d blocks", (size + 511) / 512);
         } else {
@@ -181,12 +187,12 @@ static void* vmuWriter(void* p) {
 
 /* Serialises all files into one compressed VMU package (main thread, a few ms). */
 static uint8_t* buildPackage(DcFs* fs, int* outSize) {
-    size_t raw = 8;
+    size_t raw = 12;
     for (int32_t i = 0; i < fs->count; i++) raw += 8 + strlen(fs->files[i].name) + (size_t) fs->files[i].size;
     uint8_t* buf = (uint8_t*) safeMalloc(raw);
     uint8_t* p = buf;
-    uint32_t magic = SAVE_MAGIC, cnt = (uint32_t) fs->count;
-    memcpy(p, &magic, 4); memcpy(p + 4, &cnt, 4); p += 8;
+    uint32_t magic = SAVE_MAGIC, cnt = (uint32_t) fs->count, seq = ++fs->seq;
+    memcpy(p, &magic, 4); memcpy(p + 4, &seq, 4); memcpy(p + 8, &cnt, 4); p += 12;
     for (int32_t i = 0; i < fs->count; i++) {
         uint32_t nl = (uint32_t) strlen(fs->files[i].name), dl = (uint32_t) fs->files[i].size;
         memcpy(p, &nl, 4); memcpy(p + 4, &dl, 4); p += 8;
@@ -245,43 +251,71 @@ void DcFileSystem_waitIdle(FileSystem* base) {
     while (fs->busy) thd_sleep(10);
 }
 
-static void loadFromVmu(DcFs* fs) {
-    char path[64];
-    if (!findVmu(path, sizeof path)) { snprintf(fs->status, sizeof fs->status, "No VMU found"); return; }
+/* Reads one save slot; returns the decompressed payload (caller frees) or NULL. */
+static uint8_t* readSlot(const char* path, uint32_t* outLen, uint32_t* outSeq) {
     file_t f = fs_open(path, O_RDONLY);
-    if (f == FILEHND_INVALID) { snprintf(fs->status, sizeof fs->status, "No save on VMU"); return; }
+    if (f == FILEHND_INVALID) return nullptr;
     size_t n = fs_total(f);
-    uint8_t* b = (uint8_t*) safeMalloc(n);
+    uint8_t* b = (uint8_t*) safeMalloc(n ? n : 1);
     ssize_t got = fs_read(f, b, n);
     fs_close(f);
+    if (got != (ssize_t) n || n < 8) { free(b); logWarn("DC fs: could not read %s\n", path); return nullptr; }
+    /* KOS's /vmu driver strips the VMS header and returns only the payload (padded to a block);
+       raw reads include the header. Accept both. */
+    const uint8_t* payload = b;
+    size_t payloadLen = n;
     vmu_pkg_t pkg;
-    if (got != (ssize_t) n || vmu_pkg_parse(b, n, &pkg) < 0 || pkg.data_len < 4) { free(b); snprintf(fs->status, sizeof fs->status, "VMU save is damaged"); return; }
+    if (vmu_pkg_parse(b, n, &pkg) == 0 && pkg.data_len >= 4) { payload = pkg.data; payloadLen = (size_t) pkg.data_len; }
     uint32_t rawSize;
-    memcpy(&rawSize, pkg.data, 4);
+    memcpy(&rawSize, payload, 4);
+    if (rawSize < 12 || rawSize > 1024 * 1024) { free(b); logWarn("DC fs: %s is damaged, ignoring it\n", path); return nullptr; }
     uint8_t* raw = (uint8_t*) safeMalloc(rawSize);
     mz_ulong rl = rawSize;
-    if (mz_uncompress(raw, &rl, pkg.data + 4, (mz_ulong) (pkg.data_len - 4)) != MZ_OK || rl < 8) { free(raw); free(b); return; }
+    int zr = mz_uncompress(raw, &rl, payload + 4, (mz_ulong) (payloadLen - 4));
     free(b);
-    uint8_t* p = raw;
-    uint32_t magic, cnt;
-    memcpy(&magic, p, 4); memcpy(&cnt, p + 4, 4); p += 8;
-    if (magic != SAVE_MAGIC) { free(raw); return; }
-    for (uint32_t i = 0; i < cnt && p + 8 <= raw + rl; i++) {
+    uint32_t magic;
+    memcpy(&magic, raw, 4);
+    if (zr != MZ_OK || rl < 12 || magic != SAVE_MAGIC) { free(raw); logWarn("DC fs: %s is damaged, ignoring it\n", path); return nullptr; }
+    memcpy(outSeq, raw + 4, 4);
+    *outLen = (uint32_t) rl;
+    return raw;
+}
+
+static void loadFromVmu(DcFs* fs) {
+    char dir[32];
+    if (!findVmu(dir, sizeof dir)) { snprintf(fs->status, sizeof fs->status, "No VMU found"); return; }
+    uint8_t* best = nullptr; uint32_t bestLen = 0, bestSeq = 0; int bestSlot = -1;
+    for (int slot = 0; slot < 2; slot++) {
+        char path[64];
+        snprintf(path, sizeof path, "%s/%s", dir, slot == 0 ? SAVE_NAME_A : SAVE_NAME_B);
+        uint32_t len, seq;
+        uint8_t* raw = readSlot(path, &len, &seq);
+        if (!raw) continue;
+        if (!best || seq > bestSeq) { free(best); best = raw; bestLen = len; bestSeq = seq; bestSlot = slot; }
+        else free(raw);
+    }
+    if (!best) { snprintf(fs->status, sizeof fs->status, "No save on VMU"); return; }
+    fs->seq = bestSeq;
+    fs->lastSlot = bestSlot;
+    uint8_t* p = best + 8;
+    uint32_t cnt;
+    memcpy(&cnt, p, 4); p += 4;
+    for (uint32_t i = 0; i < cnt && p + 8 <= best + bestLen; i++) {
         uint32_t nl, dl;
         memcpy(&nl, p, 4); memcpy(&dl, p + 4, 4); p += 8;
-        if (p + nl + dl > raw + rl) break;
+        if (p + nl + dl > best + bestLen) break;
         char name[256];
         uint32_t cn = nl < 255 ? nl : 255;
         memcpy(name, p, cn); name[cn] = 0; p += nl;
         MemFile* mf = createFile(fs, name);
+        free(mf->data);
         mf->data = (uint8_t*) safeMalloc(dl + 1);
         memcpy(mf->data, p, dl); mf->data[dl] = 0;
         mf->size = (int32_t) dl;
         p += dl;
     }
-    free(raw);
-    snprintf(fs->status, sizeof fs->status, "Loaded %d files from VMU", fs->count);
-    logInfo("DC fs: %s\n", fs->status);
+    free(best);
+    snprintf(fs->status, sizeof fs->status, "Loaded %d files from VMU (save #%u)", fs->count, (unsigned) bestSeq);
 }
 
 void DcFileSystem_tick(FileSystem* base) {
@@ -477,8 +511,10 @@ FileSystem* DcFileSystem_create(const char* gameTitle, const char* discRoot) {
     DcFs* fs = (DcFs*) safeCalloc(1, sizeof(DcFs));
     fs->base.vtable = &dfVtable;
     snprintf(fs->title, sizeof fs->title, "%s", gameTitle ? gameTitle : "Game");
+    fs->lastSlot = -1;
     snprintf(fs->discRoot, sizeof fs->discRoot, "%s", discRoot);
     loadFromVmu(fs);
+    logInfo("DC fs: %s\n", fs->status);
     sem_init(&fs->workSem, 0);
     mutex_init(&fs->jobLock, MUTEX_TYPE_NORMAL);
     fs->writer = thd_create(1, vmuWriter, fs);

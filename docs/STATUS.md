@@ -7,7 +7,8 @@
 - Rendering: sprites (scaled/rotated/coloured), tiles, backgrounds, text with gradients, rectangles,
   lines, primitives, blend modes, views/ports
 - Input (controller → keyboard emulation), naming screen, menus, overworld, battle
-- Music streaming with looping, sound effects, VMU save/load in the background
+- Music streaming with looping, sound effects
+- VMU saves: real SAVE point → reboot → Continue screen shows the file → Continue returns to the save point (tests/save.txt, tests/cont.txt). Saves alternate between two VMU files so an interrupted write never loses the previous save
 - Locked 30 fps in every tested scene
 
 ## Gaps / TODO

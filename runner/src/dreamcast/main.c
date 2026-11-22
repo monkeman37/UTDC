@@ -304,7 +304,13 @@ int main(MAYBE_UNUSED int argc, MAYBE_UNUSED char** argv) {
 
         if (!pollInput(runner)) break;
         if (playback) InputRecording_processFrame(playback, runner->keyboard, runner->frameCount);
-        if (exitFrame >= 0 && runner->frameCount >= exitFrame) { logInfo("DC: exit frame reached\n"); break; }
+        if (exitFrame >= 0 && runner->frameCount >= exitFrame) {
+            /* automated tests: finish any VMU write, then idle so the harness can stop the emulator safely */
+            DcFileSystem_flush(fileSystem);
+            DcFileSystem_waitIdle(fileSystem);
+            logInfo("DC: test finished at frame %d\n", runner->frameCount);
+            for (;;) thd_sleep(1000);
+        }
 
         uint64_t t0 = timer_us_gettime64();
         Runner_step(runner);
