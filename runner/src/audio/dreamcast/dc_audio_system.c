@@ -27,8 +27,8 @@
 
 #define MAX_INSTANCES 48
 #define MAX_STREAM_SLOTS 64
-#define MAX_ACTIVE_STREAMS 3       /* KOS supports 4; keep one spare */
-#define STREAM_BUF_PER_CHANNEL (16 * 1024)
+#define MAX_ACTIVE_STREAMS 4       /* KOS supports at most 4 */
+#define STREAM_BUF_PER_CHANNEL SND_STREAM_BUFFER_MAX_ADPCM /* ~32 KB = 1.5 s of 44.1 kHz ADPCM */
 #define SFX_CACHE_BUDGET (1200 * 1024)
 
 typedef struct {
@@ -499,14 +499,35 @@ static float dcaGetSoundGain(AudioSystem* audio, int32_t target) {
     return g;
 }
 
+/* Restarts a music stream at a new playback rate, continuing from the same position.
+   (KOS streams can't change frequency while running.) */
+static void restartStreamAtPitch(DcAudioSystem* a, DcInstance* in) {
+    UtdcAudEntry* e = &a->entries[in->entry];
+    mutex_lock(&a->lock);
+    if (in->stream != SND_STREAM_INVALID) {
+        snd_stream_stop(in->stream);
+        uint32_t freq = (uint32_t) ((float) e->rate * in->pitch);
+        if (freq < 1000) freq = 1000;
+        if (freq > 88200) freq = 88200;
+        snd_stream_start_adpcm(in->stream, freq, e->channels == 2);
+        snd_stream_volume(in->stream, in->paused ? 0 : volToAica(effectiveGain(a, in)));
+    }
+    mutex_unlock(&a->lock);
+}
+
 static void dcaSetSoundPitch(AudioSystem* audio, int32_t target, float pitch) {
     DcAudioSystem* a = (DcAudioSystem*) audio;
     if (pitch <= 0.0f) pitch = 0.01f;
     FOR_TARGETS(a, target, {
+        bool changed = fabsf(in->pitch - pitch) > 0.0005f;
         in->pitch = pitch;
-        if (in->kind == UTDC_AUDKIND_SFX && in->chn >= 0)
-            aicaChannelUpdate(in->chn, AICA_CH_UPDATE_SET_FREQ, 0, (uint32_t) (a->entries[in->entry].rate * pitch));
-        /* stream pitch takes effect the next time the stream is started */
+        if (changed) {
+            if (in->kind == UTDC_AUDKIND_SFX) {
+                if (in->chn >= 0) aicaChannelUpdate(in->chn, AICA_CH_UPDATE_SET_FREQ, 0, (uint32_t) (a->entries[in->entry].rate * pitch));
+            } else {
+                restartStreamAtPitch(a, in);
+            }
+        }
     });
 }
 

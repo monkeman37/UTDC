@@ -3,11 +3,11 @@
 ## Working (verified in Flycast)
 
 - Boot from GD-ROM image, loading screen, VMU detection
-- Full asset pipeline: 6,550 texture items → 189 PVR pages, 279 sound effects, 164 music tracks
+- Full asset pipeline: 6,550 texture items → 189 PVR pages, 264 sound effects, 179 streams (music + long effects), all at the original 44.1 kHz
 - Rendering: sprites (scaled/rotated/coloured), tiles, backgrounds, text with gradients, rectangles,
   lines, primitives, blend modes, views/ports
 - Input (controller → keyboard emulation), naming screen, menus, overworld, battle
-- Music streaming with looping, sound effects
+- Music streaming with looping, sound effects; playback speed/pitch matches the PC version (no 22 kHz downsampling, no truncated long effects, live music pitch changes)
 - VMU saves: real SAVE point → reboot → Continue screen shows the file → Continue returns to the save point (tests/save.txt, tests/cont.txt). Saves alternate between two VMU files so an interrupted write never loses the previous save
 - Locked 30 fps in every tested scene
 
@@ -16,7 +16,6 @@
 | Area | Detail |
 |---|---|
 | Surfaces | `surface_set_target` draws are skipped and `draw_surface` is a no-op. Undertale uses one surface for a transition effect. A PVR render-to-texture pass could implement it. |
-| Music pitch | `audio_sound_pitch` on a playing music stream applies the next time it starts (SFX pitch is live). Needs a KOS stream channel-frequency update. |
 | CDI output | Only GDI is written. CD-R users need a DiscJuggler CDI (data/data, scrambled 1ST_READ.BIN, MSINFO-adjusted ISO). |
 | Real hardware | Untested. GD-ROM seek times are much higher than in emulators; texture pages are sector-aligned and read in one request, but room loads may hitch longer. |
 | Redream | Untested (GDI with raw 2352-byte data tracks should load). |

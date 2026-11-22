@@ -12,7 +12,7 @@
 
 #include <stdint.h>
 
-#define UTDC_FORMAT_VERSION 2
+#define UTDC_FORMAT_VERSION 3
 
 /* ------------------------------------------------------------------------
  * TEXTURES.BIN

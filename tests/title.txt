@@ -1,0 +1,3 @@
+wait 120
+tap Z
+wait 1500

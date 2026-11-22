@@ -247,8 +247,8 @@ static int file_exists_ci(const char* dir, const char* name, char* outPath, size
 }
 
 int build_audio(BuildContext* ctx, const DataWinFile* dw, const BuildOptions* opts, const char* outPath) {
-    int musicRate = opts->musicRate > 0 ? opts->musicRate : 32000;
-    int sfxRate = opts->sfxRate > 0 ? opts->sfxRate : 22050;
+    int musicRate = opts->musicRate > 0 ? opts->musicRate : 44100;
+    int sfxRate = opts->sfxRate > 0 ? opts->sfxRate : 44100;
     Entry* entries = (Entry*)calloc(dw->soundCount + 1, sizeof(Entry));
     int32_t* map = (int32_t*)malloc((dw->soundCount + 1) * sizeof(int32_t));
     int count = 0;
@@ -296,15 +296,27 @@ int build_audio(BuildContext* ctx, const DataWinFile* dw, const BuildOptions* op
         (void)isOgg;
 
         double secs = (double)pcm.frames / pcm.rate;
+        /* The AICA addresses a one-shot sample with 16-bit start/end registers, so a sound effect
+           must be at most 65534 samples. Use the source rate (44.1 kHz) when it fits, else the
+           highest rate that fits (down to 16 kHz); longer sounds are streamed from disc instead. */
+        const double AICA_MAX_SAMPLES = 65534.0;
         int stream = !embedded && secs > SFX_MAX_SECONDS;
         if (embedded && secs > 20.0) stream = 1;
+        int sfxTarget = sfxRate;
+        if (!stream) {
+            double fitRate = AICA_MAX_SAMPLES / (secs > 0 ? secs : 1);
+            if (fitRate >= sfxRate) sfxTarget = sfxRate;
+            else if (fitRate >= 16000.0) sfxTarget = (int) fitRate & ~1;
+            else stream = 1;
+        }
         if (stream) {
             resample(&pcm, musicRate);
             ctx->stats.musicSeconds += secs;
             ctx->stats.streamCount++;
         } else {
             to_mono(&pcm);
-            resample(&pcm, sfxRate);
+            resample(&pcm, sfxTarget);
+            if (pcm.frames > 65472) pcm.frames = 65472; /* stays <= 65534 after 64-sample ADPCM padding */
             ctx->stats.sfxCount++;
         }
         Entry* e = &entries[count];

@@ -15,8 +15,8 @@ typedef struct {
     const char* gameDir;     /* folder containing data.win and the .ogg files */
     const char* outPath;     /* .gdi or .cdi path */
     DiscFormat  format;
-    int         musicRate;   /* Hz for streamed music, default 32000 */
-    int         sfxRate;     /* max Hz for sound effects, default 22050 */
+    int         musicRate;   /* Hz for streamed music, default 44100 (same as the PC version) */
+    int         sfxRate;     /* max Hz for sound effects, default 44100 */
     const char* tempDir;     /* scratch folder; defaults next to outPath */
     /* developer/test options */
     const char* testInputs;  /* Butterscotch input-playback JSON copied to the disc as INPUT.JSN */
