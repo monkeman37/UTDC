@@ -1,0 +1,26 @@
+--- a/kernel/arch/dreamcast/fs/fs_iso9660.c	2026-11-22 22:40:12.086281595 +0200
++++ b/kernel/arch/dreamcast/fs/fs_iso9660.c	2026-11-22 22:40:12.101120259 +0200
+@@ -344,11 +344,19 @@
+         return -1;
+     }
+ 
+-    if((i = cdrom_read_toc(&toc, false)) != 0)
+-        return i;
++    /* GD-ROM images keep the filesystem in the high-density area (track 3+);
++       try that first and fall back to the low-density/CD-R layout. */
++    session_base = 0;
++    if(cdrom_read_toc(&toc, true) == 0)
++        session_base = cdrom_locate_data_track(&toc);
+ 
+-    if(!(session_base = cdrom_locate_data_track(&toc)))
+-        return -1;
++    if(!session_base) {
++        if((i = cdrom_read_toc(&toc, false)) != 0)
++            return i;
++
++        if(!(session_base = cdrom_locate_data_track(&toc)))
++            return -1;
++    }
+ 
+     /* Check for joliet extensions */
+     joliet = 0;

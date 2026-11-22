@@ -1,0 +1,36 @@
+wait 120
+tap Z
+wait 150
+tap Z
+wait 60
+tap Z
+wait 60
+tap Z
+wait 10
+tap DOWN 8
+tap RIGHT 2
+tap Z
+wait 120
+tap RIGHT
+wait 10
+tap Z
+wait 400
+hold DOWN 35
+hold RIGHT 260
+wait 30
+hold LEFT 12
+hold UP 40
+hold DOWN 80
+hold RIGHT 40
+wait 30
+hold UP 70        # walk up to the flower
+tap Z 25          # advance dialogue until the battle starts
+wait 60
+tap Z 25
+wait 200
+hold LEFT 30      # move the soul around during the attack
+hold RIGHT 60
+hold UP 20
+hold DOWN 20
+tap Z 25
+wait 300

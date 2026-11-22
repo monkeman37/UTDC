@@ -1,0 +1,14 @@
+# build outputs
+runner/build-*/
+builder/build-*/
+*.gdi
+*.cdi
+track0*.bin
+track0*.raw
+utdc_tmp/
+# never commit game files
+data.win
+*.ogg
+*.win
+UNDERTALE.exe
+runner/tests/
