@@ -34,6 +34,7 @@
 #include "dc_audio_system.h"
 #include "input_recording.h"
 #include "bytecode_cache.h"
+#include "dc_text_patches.h"
 #include <dc/vblank.h>
 
 KOS_INIT_FLAGS(INIT_DEFAULT | INIT_MALLOCSTATS);
@@ -226,6 +227,7 @@ int main(MAYBE_UNUSED int argc, MAYBE_UNUSED char** argv) {
 
     DataWin* dataWin = DataWin_parse(DISC_ROOT "/DATA.WIN", options);
     if (!dataWin) fatal("Could not read DATA.WIN from the disc.", "Rebuild the image with the UTDC wizard.");
+    DcTextPatches_apply(dataWin);
     {
         struct mallinfo mi = mallinfo();
         logInfo("DC: data.win loaded, heap in use %d KB\n", mi.uordblks / 1024);

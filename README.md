@@ -40,6 +40,11 @@ Matches the official console versions by button position:
 | Start | Confirm / skip |
 | A+B+X+Y+Start | Return to the Dreamcast BIOS |
 
+On-screen prompts (title screen, instruction screen, the in-game menu tutorial)
+show Dreamcast buttons instead of keyboard keys. This is done by swapping
+those text strings at load time (`runner/src/dreamcast/dc_text_patches.c`);
+no game scripts are modified.
+
 Saves go to the first VMU found (one file, ~2 blocks, shows as "UNDERTALE DC").
 Writes happen in the background, so saving never stalls the game.
 

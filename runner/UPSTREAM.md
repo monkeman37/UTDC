@@ -5,7 +5,7 @@
 
 Dreamcast-specific additions (new files):
 
-- `src/dreamcast/` - platform layer: main loop, PowerVR2 renderer, VMU save system
+- `src/dreamcast/` - platform layer: main loop, PowerVR2 renderer, VMU save system, button-prompt text patches
 - `src/audio/dreamcast/` - AICA audio backend (ADPCM sound effects + streamed music)
 - `src/bytecode_cache.[ch]` - per-script compressed bytecode with an LRU decompression cache
 
