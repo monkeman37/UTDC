@@ -8,21 +8,57 @@ A Dreamcast port of UNDERTALE built on a GameMaker runner re-implementation
 from your own installed copy of UNDERTALE (Steam/GOG, PC version 1.0x with
 `data.win`) using the included wizard.
 
-## Quick start (Windows)
+## Building the ROM
 
-1. Download `UTDC-Wizard.exe` from the Releases page (or build it, see below).
-2. Run it.
-3. **1.** Pick your UNDERTALE folder (the one with `data.win`; in Steam:
-   right-click UNDERTALE → *Manage* → *Browse local files*).
-4. **2.** Pick where to save `UNDERTALE.gdi`.
-5. **3.** Press *Build*. It takes about a minute and produces
-   `UNDERTALE.gdi` + `track01.bin`, `track02.raw`, `track03.bin` (~330 MB).
+You need your own copy of UNDERTALE (the PC version: the folder that contains
+`data.win` and the `.ogg` music files). In Steam: right-click UNDERTALE →
+*Manage* → *Browse local files*. Downloads are on the
+[Releases page](https://github.com/monkeman37/UTDC/releases).
 
-Play it in **Redream** or **Flycast**, or copy the folder to a **GDEMU/MODE**
-SD card for real hardware. Keep the `.gdi` next to its track files.
+### Windows
 
-A command-line version is included too:
-`utdc-builder-cli "C:\...\Undertale" out\UNDERTALE.gdi`
+1. Download `UTDC-Wizard.exe`.
+2. Run it and pick your UNDERTALE folder.
+3. Pick where to save `UNDERTALE.gdi`.
+4. Press *Build* (about a minute).
+
+Prefer the command line? Use `utdc-builder-cli.exe "C:\...\Undertale" out\UNDERTALE.gdi`.
+
+### Linux
+
+1. Download `utdc-builder-cli-linux` (a static build, runs on any x86-64 distro).
+2. Run:
+
+   ```sh
+   chmod +x utdc-builder-cli-linux
+   ./utdc-builder-cli-linux ~/path/to/Undertale out/UNDERTALE.gdi
+   ```
+
+If you only have the native Linux release of UNDERTALE (`assets/game.unx`
+instead of `data.win`), use the Windows files instead; in Steam you can get
+them with *Properties → Compatibility → Force Proton*.
+
+### macOS
+
+There is no prebuilt macOS builder yet; compile the small builder yourself
+(needs Xcode command line tools and CMake, e.g. `brew install cmake ninja`):
+
+1. Download the source and `1ST_READ.BIN` + `IP.BIN` from the release into one folder, e.g. `~/utdc-payload`.
+2. Build and run:
+
+   ```sh
+   cmake -S builder -B build -G Ninja -DUTDC_PAYLOAD_DIR=$HOME/utdc-payload
+   ninja -C build
+   ./build/utdc-builder-cli ~/path/to/Undertale out/UNDERTALE.gdi
+   ```
+
+The macOS build has not been tested yet.
+
+### Playing it
+
+You get `UNDERTALE.gdi` plus `track01.bin`, `track02.raw` and `track03.bin`
+(~450 MB); keep them together. Open the `.gdi` in **Flycast** or **Redream**,
+or copy the folder to a **GDEMU / MODE** SD card for a real Dreamcast.
 
 ## Controls
 
@@ -67,24 +103,23 @@ Writes happen in the background, so saving never stalls the game.
 
 ## Status
 
-Tested in Flycast (dynarec, HLE BIOS) with scripted input from boot through
-the intro, title, naming screen, the first Ruins rooms and the first battle:
+Tested in Flycast (dynarec, HLE BIOS): scripted play from boot through the
+intro, naming screen, Ruins and the first battle, plus automated sweeps
+through all 336 rooms and all 113 battle groups (see
+[docs/TESTING.md](docs/TESTING.md)):
 
-- locked **30 fps** (each frame held for exactly two 60 Hz vblanks)
-- ~2 ms game logic, ≤14 ms render per frame
-- ~1.9 MB RAM free during play (of 16 MB), texture eviction working
-- music streaming, sound effects, VMU saves
+- **30 fps** in normal play (each frame held for two 60 Hz vblanks); short dips remain on
+  some battle starts and while a killed monster turns to dust
+- room changes ~30 ms, ≥1 MB RAM free, music/sound at the PC version's 44.1 kHz, VMU saves
+- story events that close or restart the game, window shakes and clock-based events work
 
-Known gaps (see [docs/STATUS.md](docs/STATUS.md)):
+Known gaps (see [docs/STATUS.md](docs/STATUS.md)): drawing into GameMaker
+user surfaces (only the static on one fake-crash screen), CDI output for
+CD-Rs, and testing on real hardware / Redream.
 
-- GameMaker *surfaces* are not rendered (Undertale uses one, for a transition effect).
-- Pitch changes on *music* take effect only when a track restarts (sound-effect pitch works).
-- Only GDI output for now (GDEMU and emulators). CDI for burning CD-Rs is not done yet.
-- Not yet tested on real hardware or in Redream; later areas of the game are untested.
+## Building everything from source
 
-## Building from source
-
-Linux or WSL:
+Only needed for development. Linux or WSL:
 
 ```sh
 toolchain/build-toolchain.sh          # SH-4 GCC 15 + KallistiOS (+ UTDC patch), ~1.5 h once
