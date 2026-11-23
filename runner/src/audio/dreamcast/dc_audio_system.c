@@ -78,6 +78,7 @@ typedef struct {
     uint32_t playStartSample;/* song sample at which the current AICA playback started */
     uint64_t playStartMs;
     bool started;            /* AICA stream running */
+    int aicaCh[2];           /* the AICA channels KOS gave this stream (for live pitch changes) */
     DcAudioSystem* owner;
 } DcInstance;
 
@@ -597,6 +598,12 @@ static int32_t dcaPlaySound(AudioSystem* audio, int32_t soundIndex, int32_t prio
         if (!in->buf) { fs_close(in->file); in->file = FILEHND_INVALID; return -1; }
         mutex_lock(&a->lock);
         in->active = true;
+        /* KOS gives a new stream the lowest free channels; find out which, so pitch can be
+           changed live by writing the channel frequency (no stream restart). */
+        in->aicaCh[0] = snd_sfx_chn_alloc();
+        in->aicaCh[1] = snd_sfx_chn_alloc();
+        if (in->aicaCh[0] >= 0) snd_sfx_chn_free(in->aicaCh[0]);
+        if (in->aicaCh[1] >= 0) snd_sfx_chn_free(in->aicaCh[1]);
         in->stream = snd_stream_alloc(streamCallback, STREAM_BUF_PER_CHANNEL);
         if (in->stream == SND_STREAM_INVALID) {
             mutex_unlock(&a->lock);
@@ -738,11 +745,28 @@ static float dcaGetSoundGain(AudioSystem* audio, int32_t target) {
 
 /* Restarts a music stream at a new playback rate, continuing from the same position.
    (KOS streams can't change frequency while running.) */
-static void restartStreamAtPitch(DcAudioSystem* a, DcInstance* in) {
+/* Applies a new pitch to a running stream by changing the AICA channel frequency in place.
+   The position estimate is rebased so track position / pause stay exact. */
+static void restartStreamAtPitch(DcAudioSystem* a, DcInstance* in, float oldPitch) {
+    UtdcAudEntry* e = &a->entries[in->entry];
     mutex_lock(&a->lock);
     if (in->stream != SND_STREAM_INVALID && in->started) {
-        streamStopAica(a, in);
-        streamStartAica(a, in);
+        float newPitch = in->pitch;
+        in->pitch = oldPitch;
+        uint32_t heard = streamPlayingSample(a, in);
+        in->pitch = newPitch;
+        in->playStartSample = heard;
+        in->playStartMs = timer_ms_gettime64();
+        uint32_t freq = (uint32_t) ((float) e->rate * newPitch);
+        if (freq < 1000) freq = 1000;
+        if (freq > 88200) freq = 88200;
+        if (in->aicaCh[0] >= 0) {
+            aicaChannelUpdate(in->aicaCh[0], AICA_CH_UPDATE_SET_FREQ, 0, freq);
+            if (e->channels == 2 && in->aicaCh[1] >= 0) aicaChannelUpdate(in->aicaCh[1], AICA_CH_UPDATE_SET_FREQ, 0, freq);
+        } else {
+            streamStopAica(a, in);
+            streamStartAica(a, in);
+        }
     }
     mutex_unlock(&a->lock);
 }
@@ -752,12 +776,13 @@ static void dcaSetSoundPitch(AudioSystem* audio, int32_t target, float pitch) {
     if (pitch <= 0.0f) pitch = 0.01f;
     FOR_TARGETS(a, target, {
         bool changed = fabsf(in->pitch - pitch) > 0.0005f;
+        float oldPitch = in->pitch;
         in->pitch = pitch;
         if (changed) {
             if (in->kind == UTDC_AUDKIND_SFX) {
                 if (in->chn >= 0) aicaChannelUpdate(in->chn, AICA_CH_UPDATE_SET_FREQ, 0, (uint32_t) (a->entries[in->entry].rate * pitch));
             } else {
-                restartStreamAtPitch(a, in);
+                restartStreamAtPitch(a, in, oldPitch);
             }
         }
     });

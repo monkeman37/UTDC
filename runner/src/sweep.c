@@ -81,7 +81,8 @@ void Sweep_tick(Runner* runner) {
         } else if (g_mode == 2) {
             if (item >= 0 && (uint32_t) item < runner->dataWin->objt.count) {
                 logInfo("SWEEP: item %d object %d %s (frame %d)\n", g_pos - 1, item, runner->dataWin->objt.objects[item].name, frame);
-                Runner_createInstance(runner, 0, 0, item);
+                int count = getenv("BS_SWEEP_COUNT") ? atoi(getenv("BS_SWEEP_COUNT")) : 1;
+                for (int k = 0; k < count; k++) Runner_createInstance(runner, (GMLReal) (40 + rnd() % 240), (GMLReal) (40 + rnd() % 160), item);
             }
         } else {
             logInfo("SWEEP: item %d battlegroup %d (frame %d)\n", g_pos - 1, item, frame);
@@ -96,6 +97,13 @@ void Sweep_tick(Runner* runner) {
     if (g_mode == 3 && g_soundId >= 0 && getenv("BS_SWEEP_PAUSETEST")) {
         if (frame == g_itemStart + 90) { runner->audioSystem->vtable->pauseSound(runner->audioSystem, g_soundId); logInfo("SWEEP: paused %d\n", g_soundId); }
         if (frame == g_itemStart + 150) { runner->audioSystem->vtable->resumeSound(runner->audioSystem, g_soundId); logInfo("SWEEP: resumed %d\n", g_soundId); }
+    }
+    // BS_SWEEP_PITCHTEST: from 2 s in, lower the pitch a little every frame (like Flowey's
+    // first battle when every pellet is dodged)
+    if (g_mode == 3 && g_soundId >= 0 && getenv("BS_SWEEP_PITCHTEST") && frame > g_itemStart + 60) {
+        float p = 1.0f - 0.004f * (float) (frame - g_itemStart - 60);
+        if (p < 0.4f) p = 0.4f;
+        runner->audioSystem->vtable->setSoundPitch(runner->audioSystem, g_soundId, p);
     }
     // keep the player alive in battles
     if (g_mode == 1) {

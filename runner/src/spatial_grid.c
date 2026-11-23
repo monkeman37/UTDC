@@ -83,6 +83,35 @@ void SpatialGrid_removeInstance(SpatialGrid* grid, Instance* instance) {
     }
 }
 
+static bool ptrInSorted(Instance* const* sorted, int32_t n, const Instance* p) {
+    int32_t lo = 0, hi = n - 1;
+    while (lo <= hi) {
+        int32_t mid = (lo + hi) / 2;
+        if (sorted[mid] == p) return true;
+        if ((uintptr_t) sorted[mid] < (uintptr_t) p) lo = mid + 1; else hi = mid - 1;
+    }
+    return false;
+}
+
+// Removes many instances at once: one pass over the grid, filtering against a sorted pointer
+// array (removing them one by one scans the whole grid for each instance).
+void SpatialGrid_removeInstancesBatch(SpatialGrid* grid, Instance* const* sortedPtrs, int32_t n) {
+    if (n <= 0) return;
+    int32_t totalCells = (int32_t) grid->gridWidth * (int32_t) grid->gridHeight;
+    repeat(totalCells, cellIndex) {
+        Instance** cell = grid->grid[cellIndex];
+        int32_t cellLen = (int32_t) arrlen(cell);
+        int32_t w = 0;
+        for (int32_t j = 0; j < cellLen; j++) if (!ptrInSorted(sortedPtrs, n, cell[j])) cell[w++] = cell[j];
+        if (w != cellLen) arrsetlen(grid->grid[cellIndex], w);
+    }
+    repeat(n, i) {
+        Instance* inst = sortedPtrs[i];
+        arrsetlen(inst->collisionCells, 0);
+        inst->spatialGridDirty = false;
+    }
+}
+
 void SpatialGrid_syncGrid(Runner* runner, SpatialGrid* grid) {
     bool requiresResync = arrlen(grid->dirtyInstances);
     if (!requiresResync) return;

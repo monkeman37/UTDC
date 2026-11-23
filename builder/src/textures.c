@@ -20,7 +20,7 @@
 
 #define PAGE_SIZE 256  /* small pages: a frame only pays VRAM for the parts of an atlas it uses */
 #define MAX_TEX   1024
-#define GAP       1
+#define GAP       2  /* 1 texel of padding on every side, filled with copies of the edge texels */
 
 typedef struct { int x, y, w; } SkyNode;
 
@@ -261,6 +261,7 @@ int build_textures(BuildContext* ctx, const DataWinFile* dw, const char* outPath
                     for (uint32_t q = 0; q < dw->tpagCount; q++) if (pendingSlot[q] == soft) { out.items[q].page = (uint16_t)id; pendingSlot[q] = -1; }
                     if (!sky_fit(target, dw_ + GAP, dh_ + GAP, &px, &py)) { build_log(ctx, "warning: TPAG %u too big", ti); continue; }
                 }
+                px += 1; py += 1; /* inside the padding ring */
             }
             /* blit (with nearest downscale if needed) */
             for (int y = 0; y < dh_; y++) {
@@ -268,6 +269,21 @@ int build_textures(BuildContext* ctx, const DataWinFile* dw, const char* outPath
                 for (int x = 0; x < dw_; x++) {
                     int srcx = sx + (int)((int64_t)x * sw / dw_);
                     memcpy(target->rgba + ((size_t)(py + y) * target->w + px + x) * 4, img + ((size_t)srcy * pw + srcx) * 4, 4);
+                }
+            }
+            /* Extrude the edge texels into the surrounding padding, so sampling that lands just
+               outside the item (sub-pixel positions, e.g. scrolling tile maps) repeats the edge
+               instead of showing a transparent seam. */
+            {
+                int x0 = px - 1, x1 = px + dw_, y0 = py - 1, y1 = py + dh_;
+                for (int y = py; y < py + dh_; y++) {
+                    if (x0 >= 0) memcpy(target->rgba + ((size_t)y * target->w + x0) * 4, target->rgba + ((size_t)y * target->w + px) * 4, 4);
+                    if (x1 < target->w) memcpy(target->rgba + ((size_t)y * target->w + x1) * 4, target->rgba + ((size_t)y * target->w + px + dw_ - 1) * 4, 4);
+                }
+                for (int x = px - 1; x <= px + dw_; x++) {
+                    if (x < 0 || x >= target->w) continue;
+                    if (y0 >= 0) memcpy(target->rgba + ((size_t)y0 * target->w + x) * 4, target->rgba + ((size_t)py * target->w + x) * 4, 4);
+                    if (y1 < target->h) memcpy(target->rgba + ((size_t)y1 * target->w + x) * 4, target->rgba + ((size_t)(py + dh_ - 1) * target->w + x) * 4, 4);
                 }
             }
             target->itemCount++;

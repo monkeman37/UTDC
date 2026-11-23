@@ -81,6 +81,7 @@ static inline bool SpatialGrid_instanceOverlapsRange(Instance* instance, Spatial
 SpatialGrid* SpatialGrid_create(uint32_t gridWidth, uint32_t gridHeight);
 void SpatialGrid_free(SpatialGrid* grid);
 void SpatialGrid_removeInstance(SpatialGrid* grid, Instance* instance);
+void SpatialGrid_removeInstancesBatch(SpatialGrid* grid, Instance* const* sortedPtrs, int32_t n);
 
 void SpatialGrid_syncGrid(Runner* runner, SpatialGrid* grid);
 void SpatialGrid_markInstanceAsDirty(SpatialGrid* grid, Instance* instance);

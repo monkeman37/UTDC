@@ -356,7 +356,7 @@ static void setState(DcRenderer* dc, int32_t pageId) {
         pvr_poly_cxt_txr(&cxt, PVR_LIST_TR_POLY, fmt | PVR_TXRFMT_TWIDDLED, pg->width, pg->height, dc->slots[pageId].vram,
                          filter ? PVR_FILTER_BILINEAR : PVR_FILTER_NONE);
         cxt.txr.env = PVR_TXRENV_MODULATEALPHA;
-        cxt.txr.uv_clamp = PVR_UVCLAMP_NONE;
+        cxt.txr.uv_clamp = PVR_UVCLAMP_UV; /* never wrap to the opposite page edge */
     } else {
         pvr_poly_cxt_txr(&cxt, PVR_LIST_TR_POLY, PVR_TXRFMT_ARGB1555 | PVR_TXRFMT_TWIDDLED, 8, 8, dc->whiteTex, PVR_FILTER_NONE);
         cxt.txr.env = PVR_TXRENV_MODULATEALPHA;
@@ -399,7 +399,10 @@ void DcRenderer_setWindowOffset(MAYBE_UNUSED Renderer* renderer, float dx, float
 static inline void emitVertex(float x, float y, float u, float v, uint32_t argb, bool last) {
     pvr_vertex_t vert;
     vert.flags = last ? PVR_CMD_VERTEX_EOL : PVR_CMD_VERTEX;
-    vert.x = x + g_winDX; vert.y = y + g_winDY; vert.z = 1.0f;
+    /* Snap to whole screen pixels: with nearest filtering and the 2x scale this matches the PC
+       (which rasterises at 1x) and keeps texel lookups away from item edges, so tiles drawn at
+       sub-pixel scroll positions don't show seams between them. */
+    vert.x = floorf(x + g_winDX + 0.5f); vert.y = floorf(y + g_winDY + 0.5f); vert.z = 1.0f;
     vert.u = u; vert.v = v;
     vert.argb = argb;
     vert.oargb = 0;

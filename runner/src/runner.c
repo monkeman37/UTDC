@@ -3180,24 +3180,82 @@ static void Runner_sweepDeadStructs(Runner* runner) {
     }
 }
 
+static int comparePtr(const void* a, const void* b) {
+    uintptr_t x = (uintptr_t) *(Instance* const*) a, y = (uintptr_t) *(Instance* const*) b;
+    return x < y ? -1 : x > y ? 1 : 0;
+}
+
+static bool ptrIsDestroyed(Instance* const* sorted, int32_t n, const Instance* p) {
+    int32_t lo = 0, hi = n - 1;
+    while (lo <= hi) {
+        int32_t mid = (lo + hi) / 2;
+        if (sorted[mid] == p) return true;
+        if ((uintptr_t) sorted[mid] < (uintptr_t) p) lo = mid + 1; else hi = mid - 1;
+    }
+    return false;
+}
+
+static void filterListAgainst(Instance*** listPtr, Instance* const* sorted, int32_t n) {
+    Instance** list = *listPtr;
+    int32_t len = (int32_t) arrlen(list), w = 0;
+    for (int32_t i = 0; i < len; i++) if (!ptrIsDestroyed(sorted, n, list[i])) list[w++] = list[i];
+    if (w != len) arrsetlen(*listPtr, w);
+}
+
 void Runner_cleanupDestroyedInstances(Runner* runner) {
     int32_t count = (int32_t) arrlen(runner->instances);
     int32_t writeIdx = 0;
+    static Instance** dead = nullptr; // reused scratch array
+    arrsetlen(dead, 0);
     repeat(count, i) {
         Instance* inst = runner->instances[i];
-        if (!inst->destroyed) {
-            runner->instances[writeIdx++] = inst;
-        } else {
-            Runner_removeInstanceFromObjectLists(runner, inst);
-            SpatialGrid_markInstanceAsDirty(runner->spatialGrid, inst);
-            Runner_removeInstanceLayerElement(runner, inst->instanceId);
-            hmdel(runner->instancesById, inst->instanceId);
-            Instance_free(inst);
-            // Cached drawables hold raw Instance* that we just freed; force a rebuild before the next draw.
-            runner->drawableListStructureDirty = true;
-        }
+        if (!inst->destroyed) runner->instances[writeIdx++] = inst;
+        else arrput(dead, inst);
     }
     arrsetlen(runner->instances, writeIdx);
+    int32_t nDead = (int32_t) arrlen(dead);
+    if (nDead == 0) return;
+
+    if (nDead < 8) {
+        repeat(nDead, k) {
+            Instance* inst = dead[k];
+            Runner_removeInstanceFromObjectLists(runner, inst);
+            SpatialGrid_markInstanceAsDirty(runner->spatialGrid, inst);
+        }
+    } else {
+        // Many at once (e.g. a monster's dust particles): filter each affected list and the
+        // collision grid in one pass instead of once per instance.
+        qsort(dead, (size_t) nDead, sizeof(Instance*), comparePtr);
+        DataWin* dataWin = runner->dataWin;
+        static uint8_t* touched = nullptr;
+        static uint32_t touchedCap = 0;
+        if (touchedCap < dataWin->objt.count) { free(touched); touchedCap = dataWin->objt.count; touched = (uint8_t*) safeCalloc(touchedCap, 1); }
+        static int32_t* touchedList = nullptr;
+        arrsetlen(touchedList, 0);
+        repeat(nDead, k) {
+            int32_t obj = dead[k]->objectIndex, depth = 0;
+            while (obj >= 0 && dataWin->objt.count > (uint32_t) obj && 32 > depth) {
+                if (!touched[obj]) { touched[obj] = 1; arrput(touchedList, obj); }
+                obj = dataWin->objt.objects[obj].parentId;
+                depth++;
+            }
+        }
+        repeat(arrlen(touchedList), t) {
+            int32_t obj = touchedList[t];
+            touched[obj] = 0;
+            filterListAgainst(&runner->instancesByObject[obj], dead, nDead);
+            filterListAgainst(&runner->instancesByExactObject[obj], dead, nDead);
+        }
+        SpatialGrid_removeInstancesBatch(runner->spatialGrid, dead, nDead);
+    }
+    repeat(nDead, k) {
+        Instance* inst = dead[k];
+        Runner_removeInstanceLayerElement(runner, inst->instanceId);
+        hmdel(runner->instancesById, inst->instanceId);
+        Instance_free(inst);
+    }
+    // Cached drawables hold raw Instance* that we just freed; force a rebuild before the next draw.
+    runner->drawableListStructureDirty = true;
 }
 
 void Runner_initFirstRoom(Runner* runner) {

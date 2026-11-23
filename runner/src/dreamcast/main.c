@@ -455,6 +455,23 @@ int main(MAYBE_UNUSED int argc, MAYBE_UNUSED char** argv) {
         DcFileSystem_tick(fileSystem);
 
         Sweep_tick(runner);
+        {
+            /* debug: BS_FB_DUMP_FRAME=N prints the displayed framebuffer (RGB565, hex) to the log */
+            static int dumpFrame = -2;
+            if (dumpFrame == -2) { const char* e = getenv("BS_FB_DUMP_FRAME"); dumpFrame = e ? atoi(e) : -1; }
+            if (dumpFrame >= 0 && runner->frameCount == dumpFrame) {
+                uint32_t off = PVR_GET(PVR_FB_ADDR) & 0x007FFFFFu;
+                logInfo("FBINFO addr=%08lx il=%08lx vram_s=%p cfg1=%08lx\n", (unsigned long) PVR_GET(PVR_FB_ADDR), (unsigned long) PVR_GET(PVR_FB_IL_ADDR), (void*) vram_s, (unsigned long) PVR_GET(PVR_FB_CFG_1));
+                const volatile uint16_t* fb = (const volatile uint16_t*) (PVR_RAM_BASE + off);
+                static char line[64 * 4 + 16];
+                for (int y = 0; y < 480; y++)
+                    for (int k = 0; k < 10; k++) {
+                        int n = sprintf(line, "FB%03d_%d:", y, k);
+                        for (int x = k * 64; x < (k + 1) * 64; x++) n += sprintf(line + n, "%04x", fb[y * 640 + x]);
+                        logInfo("%s\n", line);
+                    }
+            }
+        }
         if (runner->shouldExit) {
             /* game_end() from the story (the fake crash before Omega Flowey, the end of the
                Flowey fight, the genocide ending...). On PC the program closes and the player
