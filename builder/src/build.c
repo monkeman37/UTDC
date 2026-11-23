@@ -78,6 +78,7 @@ int utdc_build(BuildContext* ctx, const BuildOptions* opts) {
         fprintf(f, "title=%s\nbuilder=utdc %s\n", dw.displayName, UTDC_VERSION);
         if (opts->overlay) fprintf(f, "overlay=1\n");
         if (opts->exitFrame > 0) fprintf(f, "exitframe=%d\n", opts->exitFrame);
+        for (int i = 0; i < opts->extraCfgCount; i++) fprintf(f, "%s\n", opts->extraCfg[i]);
         fclose(f);
     }
 

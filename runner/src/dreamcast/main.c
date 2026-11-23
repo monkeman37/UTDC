@@ -22,6 +22,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <time.h>
 
 #include "runner.h"
 #include "runner_keyboard.h"
@@ -35,6 +36,8 @@
 #include "input_recording.h"
 #include "bytecode_cache.h"
 #include "dc_text_patches.h"
+#include "stb_ds.h"
+#include "sweep.h"
 #include <dc/vblank.h>
 
 KOS_INIT_FLAGS(INIT_DEFAULT | INIT_MALLOCSTATS);
@@ -103,6 +106,27 @@ static void keySet(Runner* runner, int32_t key, bool down, bool wasDown) {
     else { if (g_keyRefs[key] > 0 && --g_keyRefs[key] == 0) RunnerKeyboard_onKeyUp(runner->keyboard, key); }
 }
 
+/* Dreamcast keyboard scan code -> GameMaker virtual key */
+static int32_t kbdToVk(int code) {
+    if (code >= KBD_KEY_A && code <= KBD_KEY_Z) return 'A' + (code - KBD_KEY_A);
+    if (code >= KBD_KEY_1 && code <= KBD_KEY_9) return '1' + (code - KBD_KEY_1);
+    if (code == KBD_KEY_0) return '0';
+    if (code >= KBD_KEY_F1 && code <= KBD_KEY_F1 + 11) return 112 + (code - KBD_KEY_F1);
+    switch (code) {
+        case KBD_KEY_ENTER: case KBD_KEY_PAD_ENTER: return VK_ENTER;
+        case KBD_KEY_ESCAPE: return 27;
+        case KBD_KEY_BACKSPACE: return 8;
+        case KBD_KEY_TAB: return 9;
+        case KBD_KEY_SPACE: return 32;
+        case KBD_KEY_UP: return VK_UP;
+        case KBD_KEY_DOWN: return VK_DOWN;
+        case KBD_KEY_LEFT: return VK_LEFT;
+        case KBD_KEY_RIGHT: return VK_RIGHT;
+        case KBD_KEY_DEL: return 46;
+        default: return -1;
+    }
+}
+
 static uint32_t g_prevButtons = 0;
 static bool g_prevStick[4];
 
@@ -133,12 +157,34 @@ static bool pollInput(Runner* runner) {
     for (int i = 0; i < 4; i++) { keySet(runner, stickKeys[i], stick[i], g_prevStick[i]); g_prevStick[i] = stick[i]; }
     g_prevButtons = buttons;
 
-    /* optional USB/Dreamcast keyboard */
+    /* Dreamcast keyboard (optional): works like the PC keyboard, including typing
+       (keyboard_string) for things like Mettaton's essay question. */
     maple_device_t* kbd = maple_enum_type(0, MAPLE_FUNC_KEYBOARD);
+    static bool kbPrev[KBD_MAX_KEYS];
     if (kbd) {
+        kbd_state_t* ks = (kbd_state_t*) maple_dev_status(kbd);
+        if (ks) {
+            for (int code = 0; code < KBD_MAX_KEYS; code++) {
+                int32_t vk = kbdToVk(code);
+                if (vk < 0) continue;
+                bool down = ks->key_states[code].is_down;
+                keySet(runner, vk, down, kbPrev[code]);
+                kbPrev[code] = down;
+            }
+            uint32_t mods = ks->last_modifiers.raw;
+            static bool shiftPrev, ctrlPrev;
+            bool sh = (mods & KBD_MOD_SHIFT) != 0, ct = (mods & KBD_MOD_CTRL) != 0;
+            keySet(runner, VK_SHIFT, sh, shiftPrev); shiftPrev = sh;
+            keySet(runner, VK_CONTROL, ct, ctrlPrev); ctrlPrev = ct;
+        }
         int k;
-        while ((k = kbd_queue_pop(kbd, 1)) != KBD_QUEUE_END) {
-            (void) k; /* keyboard support is best-effort; controller is primary */
+        while ((k = kbd_queue_pop(kbd, true)) != KBD_QUEUE_END) {
+            if (k > 0 && k < 256) RunnerKeyboard_onCharacter(runner->keyboard, (unsigned) k);
+            else if ((k >> 8) == KBD_KEY_BACKSPACE) RunnerKeyboard_onCharacter(runner->keyboard, 8);
+        }
+    } else {
+        for (int code = 0; code < KBD_MAX_KEYS; code++) {
+            if (kbPrev[code]) { int32_t vk = kbdToVk(code); if (vk >= 0) keySet(runner, vk, false, true); kbPrev[code] = false; }
         }
     }
     return true;
@@ -172,6 +218,30 @@ static void drawOverlay(Renderer* renderer, const FrameStats* fs) {
     DcRenderer_screenRect(renderer, 4 + 200, 12, 4 + 201, 18, 0xFFFFFFFF); /* 33.3 ms mark */
 }
 
+/* ===[ emulated PC window ]===
+ * Some scenes move the game window around the desktop with window_set_position (the
+ * "crash" before Omega Flowey, the genocide ending shake). We pretend the window sits
+ * centred on a 1920x1080 desktop and shift the whole picture by the same amount. */
+#define WIN_BASE_X ((1920 - 640) / 2)
+#define WIN_BASE_Y ((1080 - 480) / 2)
+#define WIN_MAX_SHIFT 160
+static Renderer* g_renderer;
+static int32_t g_winX = WIN_BASE_X, g_winY = WIN_BASE_Y;
+static bool dcGetWindowPosition(int32_t* x, int32_t* y) { *x = g_winX; *y = g_winY; return true; }
+static int32_t g_winMaxShift; /* largest shift since the last stats line (logged) */
+static void dcSetWindowPosition(int32_t x, int32_t y) {
+    g_winX = x; g_winY = y;
+    int32_t m = abs(x - WIN_BASE_X) > abs(y - WIN_BASE_Y) ? abs(x - WIN_BASE_X) : abs(y - WIN_BASE_Y);
+    if (m > g_winMaxShift) g_winMaxShift = m;
+    int32_t dx = x - WIN_BASE_X, dy = y - WIN_BASE_Y;
+    if (dx < -WIN_MAX_SHIFT) dx = -WIN_MAX_SHIFT;
+    if (dx > WIN_MAX_SHIFT) dx = WIN_MAX_SHIFT;
+    if (dy < -WIN_MAX_SHIFT) dy = -WIN_MAX_SHIFT;
+    if (dy > WIN_MAX_SHIFT) dy = WIN_MAX_SHIFT;
+    DcRenderer_setWindowOffset(g_renderer, (float) dx, (float) dy);
+}
+static void dcCenterWindow(void) { dcSetWindowPosition(WIN_BASE_X, WIN_BASE_Y); }
+
 int main(MAYBE_UNUSED int argc, MAYBE_UNUSED char** argv) {
     vid_set_mode(DM_640x480, PM_RGB565);
     textScreen("UNDERTALE for Dreamcast", "Starting...", nullptr, 0);
@@ -194,7 +264,7 @@ int main(MAYBE_UNUSED int argc, MAYBE_UNUSED char** argv) {
     {
         file_t f = fs_open(DISC_ROOT "/UTDC.CFG", O_RDONLY);
         if (f != FILEHND_INVALID) {
-            char buf[512];
+            char buf[2048];
             ssize_t n = fs_read(f, buf, sizeof buf - 1);
             fs_close(f);
             if (n > 0) {
@@ -204,6 +274,15 @@ int main(MAYBE_UNUSED int argc, MAYBE_UNUSED char** argv) {
                     if (!strncmp(line, "title=", 6)) snprintf(title, sizeof title, "%s", line + 6);
                     else if (!strncmp(line, "overlay=", 8)) showOverlay = atoi(line + 8) != 0;
                     else if (!strncmp(line, "exitframe=", 10)) exitFrame = atoi(line + 10);
+                    else if (!strncmp(line, "sweep_", 6)) {
+                        /* test harness: sweep_mode=, sweep_list=, ... -> BS_SWEEP_* (see sweep.c) */
+                        char key[32]; const char* eq = strchr(line, '=');
+                        if (eq && eq - line < 24) {
+                            snprintf(key, sizeof key, "BS_SWEEP_%.*s", (int) (eq - line - 6), line + 6);
+                            for (char* k = key; *k; k++) if (*k >= 'a' && *k <= 'z') *k -= 32;
+                            setenv(key, eq + 1, 1);
+                        }
+                    }
                     line = strtok(nullptr, "\r\n");
                 }
             }
@@ -222,6 +301,8 @@ int main(MAYBE_UNUSED int argc, MAYBE_UNUSED char** argv) {
     options.parseAudo = false;
     options.skipLoadingPreciseMasksForNonPreciseSprites = true;
     options.lazyLoadRooms = true;
+    /* The battle room is entered constantly and is tiny: keep it parsed. */
+    shput(options.eagerlyLoadedRooms, "room_battle", true);
     options.loadType = DATAWINLOADTYPE_LOAD_PER_CHUNK;
     options.progressCallback = loadProgress;
 
@@ -243,7 +324,7 @@ int main(MAYBE_UNUSED int argc, MAYBE_UNUSED char** argv) {
     params.opb_sizes[PVR_LIST_TR_POLY] = PVR_BINSIZE_32;
     params.opb_sizes[PVR_LIST_TR_MOD] = PVR_BINSIZE_0;
     params.opb_sizes[PVR_LIST_PT_POLY] = PVR_BINSIZE_0;
-    params.vertex_buf_size = 640 * 1024;
+    params.vertex_buf_size = 384 * 1024; /* peak use is logged ("TA vertex buffer max") */
     params.dma_enabled = 0;
     params.fsaa_enabled = 0;
     params.autosort_disabled = 1;
@@ -265,7 +346,10 @@ int main(MAYBE_UNUSED int argc, MAYBE_UNUSED char** argv) {
     /* Deflate the patched bytecode per script and keep a 1 MB cache of decompressed scripts:
        saves roughly 3-4 MB of the Dreamcast's 16 MB. */
     BytecodeCache_compressAll(dataWin, 1024 * 1024, 3);
-    Runner* runner = Runner_create(dataWin, vm, renderer, fileSystem, audioSystem, 0);
+    /* Like GameMaker on PC, start with a random seed (clock + boot timing), so values such as
+       the FUN value rolled at the start of a new game differ between playthroughs. */
+    uint32_t bootSeed = ((uint32_t) time(NULL) * 2654435761u) ^ (uint32_t) timer_us_gettime64();
+    Runner* runner = Runner_create(dataWin, vm, renderer, fileSystem, audioSystem, bootSeed);
     {
         struct mallinfo mi = mallinfo();
         logInfo("DC: runner created, heap in use %d KB, free RAM %u KB, VRAM free %d KB\n", mi.uordblks / 1024, freeRamKB(), (int) (pvr_mem_available() / 1024));
@@ -280,6 +364,16 @@ int main(MAYBE_UNUSED int argc, MAYBE_UNUSED char** argv) {
             playback = InputRecording_createPlayer(DISC_ROOT "/INPUT.JSN", nullptr);
             logInfo("DC: input playback enabled\n");
         }
+    }
+
+    g_renderer = renderer;
+    runner->getWindowPosition = dcGetWindowPosition;
+    runner->setWindowPosition = dcSetWindowPosition;
+    runner->centerWindow = dcCenterWindow;
+    {
+        time_t now = time(NULL);
+        struct tm* lt = localtime(&now);
+        if (lt) logInfo("DC: system clock %04d-%02d-%02d %02d:%02d:%02d\n", lt->tm_year + 1900, lt->tm_mon + 1, lt->tm_mday, lt->tm_hour, lt->tm_min, lt->tm_sec);
     }
 
     vblank_handler_add(onVblank, nullptr);
@@ -336,8 +430,34 @@ int main(MAYBE_UNUSED int argc, MAYBE_UNUSED char** argv) {
         audioSystem->vtable->update(audioSystem, 1.0f / (float) roomSpeed);
         DcFileSystem_tick(fileSystem);
 
-        Runner_handlePendingRoomChange(runner);
+        Sweep_tick(runner);
+        if (runner->shouldExit) {
+            /* game_end() from the story (the fake crash before Omega Flowey, the end of the
+               Flowey fight, the genocide ending...). On PC the program closes and the player
+               starts it again; here we save, show a black screen for a moment and relaunch the
+               game the same way game_restart() does, with the save files kept. */
+            logInfo("DC: game_end() -> relaunching (frame %d)\n", runner->frameCount);
+            audioSystem->vtable->stopAll(audioSystem);
+            DcFileSystem_flush(fileSystem);
+            dcCenterWindow();
+            for (int i = 0; i < 45; i++) {
+                DcRenderer_beginScene(renderer);
+                DcRenderer_endScene(renderer);
+            }
+            DcFileSystem_waitIdle(fileSystem);
+            runner->shouldExit = false;
+            runner->pendingRoom = ROOM_RESTARTGAME;
+        }
+        {
+            uint64_t rc0 = timer_us_gettime64();
+            bool changing = runner->pendingRoom != -1;
+            Runner_handlePendingRoomChange(runner);
+            if (changing) logInfo("DC: room change took %u ms\n", (unsigned) ((timer_us_gettime64() - rc0) / 1000));
+        }
+        if (runner->currentRoom == nullptr) break;
 
+        if (t2 - t0 > 40000 && frameCounter > 120)
+            logInfo("DC: slow frame %llu: step %u ms, draw %u ms (room %s)\n", (unsigned long long) frameCounter, (unsigned) ((t1 - t0) / 1000), (unsigned) ((t2 - t1) / 1000), runner->currentRoom ? runner->currentRoom->name : "?");
         stats.stepMs = (float) (t1 - t0) / 1000.0f;
         stats.drawMs = (float) (t2 - t1) / 1000.0f;
         frameCounter++;
@@ -345,6 +465,8 @@ int main(MAYBE_UNUSED int argc, MAYBE_UNUSED char** argv) {
         uint64_t now = timer_us_gettime64();
         if (now - fpsWindowStart >= 1000000) {
             stats.fps = fpsFrames;
+            if (fpsFrames < 29 && frameCounter > 120)
+                logInfo("DC: fps dip %d (step %.1fms draw %.1fms) room %s\n", fpsFrames, (double) stats.stepMs, (double) stats.drawMs, runner->currentRoom ? runner->currentRoom->name : "?");
             fpsFrames = 0;
             fpsWindowStart = now;
         }
@@ -357,6 +479,11 @@ int main(MAYBE_UNUSED int argc, MAYBE_UNUSED char** argv) {
                     (unsigned long long) frameCounter, stats.fps, (double) stats.stepMs, (double) stats.drawMs,
                     rs->polysFrame, rs->pagesLoaded, rs->pageLoadsTotal, rs->evictions, rs->vramFree / 1024, mi.uordblks / 1024, freeRamKB(),
                     runner->currentRoom ? runner->currentRoom->name : "?");
+            {
+                pvr_stats_t ps;
+                if (pvr_get_stats(&ps) == 0 && ps.vtx_buffer_used_max > 0) logInfo("DC: TA vertex buffer max %u KB\n", (unsigned) (ps.vtx_buffer_used_max / 1024));
+            }
+            if (g_winMaxShift) { logInfo("DC: window shake up to %d px\n", (int) g_winMaxShift); g_winMaxShift = 0; }
             lastLog = now;
         }
 

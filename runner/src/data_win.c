@@ -1,4 +1,8 @@
 #include "data_win.h"
+#ifdef PLATFORM_DREAMCAST
+#include <malloc.h>
+#include <unistd.h>
+#endif
 
 const char* g_bsStaticStrBegin = nullptr;
 const char* g_bsStaticStrEnd = nullptr;
@@ -3683,6 +3687,16 @@ void DataWin_freeRoomPayload(Room* room) {
     room->payloadLoaded = false;
 }
 
+static void logDebugRoomRange(const Room* room, uint32_t start, uint32_t end) { if (getenv("BS_ROOM_RANGE_LOG")) logInfo("ROOMRANGE %s %u %u\n", room->name, start, end - start); }
+
+// Lowest file offset of a room's payload lists (backgrounds/views/objects/tiles/layers)
+static uint32_t roomPayloadStart(const Room* room) {
+    uint32_t offs[5] = { room->backgroundsFileOffset, room->viewsFileOffset, room->gameObjectsFileOffset, room->tilesFileOffset, room->layersFileOffset };
+    uint32_t m = 0;
+    for (int k = 0; k < 5; k++) if (offs[k] != 0 && (m == 0 || offs[k] < m)) m = offs[k];
+    return m;
+}
+
 void DataWin_loadRoomPayload(DataWin* dw, int32_t roomIndex) {
     require(roomIndex >= 0 && dw->room.count > (uint32_t) roomIndex);
     Room* room = &dw->room.rooms[roomIndex];
@@ -3691,6 +3705,44 @@ void DataWin_loadRoomPayload(DataWin* dw, int32_t roomIndex) {
 
     FILE* f = dw->lazyLoadFile;
     BinaryReader lazyReader = BinaryReader_create(f, dw->fileSize);
+
+    // Read the room's whole payload with one fread and parse it from memory. Parsing straight
+    // from the FILE* does many small seeks, which on optical media (Dreamcast GD-ROM) means
+    // re-reading sectors over and over (~300 ms per room change instead of ~10 ms).
+    uint32_t start = roomPayloadStart(room);
+    uint32_t end = 0;
+    repeat(dw->room.count, i) {
+        uint32_t other = roomPayloadStart(&dw->room.rooms[i]);
+        if (other > start && (end == 0 || other < end)) end = other;
+    }
+    if (end == 0 || end - start > 2u * 1024u * 1024u) end = start + 2u * 1024u * 1024u;
+    if (end > dw->fileSize) end = (uint32_t) dw->fileSize;
+    logDebugRoomRange(room, start, end);
+#ifdef PLATFORM_DREAMCAST
+    // One sector-aligned read straight from the file descriptor: the GD-ROM driver then DMAs
+    // the whole range in a single command (stdio would split it into many small requests).
+    uint32_t a0 = start & ~2047u, a1 = (end + 2047u) & ~2047u;
+    if (a1 > dw->fileSize) a1 = (uint32_t) dw->fileSize;
+    uint8_t* buf = (start != 0 && a1 > a0) ? (uint8_t*) memalign(32, a1 - a0 + 2048) : nullptr;
+    bool readOk = false;
+    if (buf != nullptr) {
+        int fd = fileno(f);
+        readOk = lseek(fd, (off_t) a0, SEEK_SET) == (off_t) a0 && read(fd, buf, a1 - a0) == (ssize_t) (a1 - a0);
+        fseek(f, 0, SEEK_SET); // drop stdio's now-stale buffer
+    }
+    if (readOk) {
+        BinaryReader_setBuffer(&lazyReader, buf, a0, a1 - a0);
+#else
+    uint8_t* buf = (start != 0 && end > start) ? (uint8_t*) malloc(end - start) : nullptr;
+    if (buf != nullptr && fseek(f, (long) start, SEEK_SET) == 0 && fread(buf, 1, end - start, f) == end - start) {
+        BinaryReader_setBuffer(&lazyReader, buf, start, end - start);
+#endif
+        readRoomPayload(&lazyReader, dw, room);
+        BinaryReader_clearBuffer(&lazyReader);
+        free(buf);
+        return;
+    }
+    free(buf);
     readRoomPayload(&lazyReader, dw, room);
 }
 

@@ -2,6 +2,7 @@
 
 #include "data_win.h"
 #include "vm.h"
+#include "sweep.h"
 #include "loop.h"
 #include "bytecode_cache.h"
 
@@ -1475,6 +1476,7 @@ int loop(CommandLineArgs args, const char *argv0) {
             if (runner->pendingRoom == -1 && shouldRender)
                 platformSwapBuffers();
             if (shouldStep) {
+                Sweep_tick(runner);
                 Runner_handlePendingRoomChange(runner);
             }
 

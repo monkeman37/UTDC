@@ -17,7 +17,15 @@ Changes to upstream files (all small and platform-neutral or guarded):
 - `src/utils.h`, `src/rvalue.h`, `src/vm_builtins.c`, `src/runner.c` - string constants from the
   data.win STRG chunk are stored by reference in ds_maps instead of being duplicated
 - `src/vm.c` - bytecode is fetched through `BytecodeCache_acquire/release`
-- `src/runner.c` - logs room transitions
+- `src/runner.c` - logs room transitions; on Dreamcast keeps the last three rooms' payloads parsed
+  and times room payload loads
+- `src/data_win.c` - lazy room payloads are read with one `fread` and parsed from memory
+- `src/vm.c` - Int64 `Conv` opcodes are handled when `NO_RVALUE_INT64` is set (Undertale emits them)
+- `src/vm_builtins.c` - `window_center` calls an optional `Runner.centerWindow` hook; `game_end` and
+  `game_restart` log their caller; date/clock builtins go through `gmlNow()` (PC test builds can
+  pin the time with `BS_FAKE_TIME`)
+- `src/runner.h` - `centerWindow` hook
+- `src/sweep.[ch]`, `src/loop.c` - automated room/battle/object coverage sweeps (test harness)
 
 To update: re-vendor a newer Butterscotch and re-apply the above (they are small).
 The Cinnamon runner (Project Sunshine's Nintendo fork) was studied for reference only;

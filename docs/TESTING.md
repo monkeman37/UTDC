@@ -48,3 +48,33 @@ butterscotch DATA.WIN --headless --lazy-rooms --lazy-textures --lazy-audio \
 
 Room transitions load 1–4 texture pages at ~16–37 ms each. VMU saves run in a
 background thread (~1 s, no frame drops).
+
+## Coverage sweeps (rooms, battles, objects)
+
+`runner/src/sweep.c` drives the game automatically. On the PC CLI build it is
+enabled with environment variables, on the Dreamcast with `--cfg` lines that the
+builder writes to `UTDC.CFG`:
+
+| PC (env) | Dreamcast (`--cfg`) | Meaning |
+|---|---|---|
+| `BS_SWEEP_MODE` | `sweep_mode=` | `rooms`, `battles` (sets `global.battlegroup`, enters `room_battle`) or `objects` (instance_create) |
+| `BS_SWEEP_LIST` | `sweep_list=` | comma-separated room indices / battle groups / object indices |
+| `BS_SWEEP_BOOT` | `sweep_boot=` | frame to start at (use with `tests/smoke.json` so a new game is running) |
+| `BS_SWEEP_FRAMES` | `sweep_frames=` | frames per item |
+| `BS_SWEEP_NOINPUT` | `sweep_noinput=1` | don't mash buttons |
+
+While sweeping, CONFIRM/CANCEL/arrows are pressed pseudo-randomly and HP is
+refilled in battles. Example (all 113 battle groups on the Dreamcast):
+
+```sh
+builder/build-linux/utdc-builder-cli Undertale out/UNDERTALE.gdi --test-inputs tests/smoke.json \
+    --cfg sweep_mode=battles --cfg sweep_list=0,1,2,... --cfg sweep_boot=1000 --cfg sweep_frames=300
+```
+
+The Dreamcast log then reports, besides the 5 s stats line:
+`DC: fps dip N`, `DC: slow frame`, `DC: room change took N ms`,
+`DC: room payload X read in N ms`, `DC: out of VRAM for page`, `DC: window shake up to N px`,
+`Runner: game_end()/game_restart() from <script>`.
+
+`BS_FAKE_TIME="YYYY-MM-DD HH:MM"` pins the clock on PC builds to test date-based
+events; the Dreamcast uses its real-time clock (set in the BIOS).

@@ -40,6 +40,10 @@ Matches the official console versions by button position:
 | Start | Confirm / skip |
 | A+B+X+Y+Start | Return to the Dreamcast BIOS |
 
+A Dreamcast keyboard also works, with the same keys as the PC version
+(Z/X/C, Enter, arrows), and can be used to type where the PC version expects
+typing.
+
 On-screen prompts (title screen, instruction screen, the in-game menu tutorial)
 show Dreamcast buttons instead of keyboard keys. This is done by swapping
 those text strings at load time (`runner/src/dreamcast/dc_text_patches.c`);

@@ -18,7 +18,7 @@
 #include "../third_party/stb/stb_image.h"
 #include "../third_party/lz4/lz4hc.h"
 
-#define PAGE_SIZE 512
+#define PAGE_SIZE 256  /* small pages: a frame only pays VRAM for the parts of an atlas it uses */
 #define MAX_TEX   1024
 #define GAP       1
 

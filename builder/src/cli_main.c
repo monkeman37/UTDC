@@ -15,7 +15,7 @@ static void on_progress(void* u, double f, const char* s) {
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        fprintf(stderr, "UTDC builder %s\nusage: %s <Undertale folder> <output.gdi> [--music-rate HZ] [--sfx-rate HZ] [--overlay] [--test-inputs FILE] [--exit-frame N]\n", UTDC_VERSION, argv[0]);
+        fprintf(stderr, "UTDC builder %s\nusage: %s <Undertale folder> <output.gdi> [--music-rate HZ] [--sfx-rate HZ] [--overlay] [--test-inputs FILE] [--exit-frame N] [--cfg KEY=VALUE]\n", UTDC_VERSION, argv[0]);
         return 2;
     }
     BuildOptions o = {0};
@@ -29,6 +29,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--sfx-rate")) o.sfxRate = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--test-inputs")) o.testInputs = argv[++i];
         else if (!strcmp(argv[i], "--exit-frame")) o.exitFrame = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--cfg") && o.extraCfgCount < 16) o.extraCfg[o.extraCfgCount++] = argv[++i];
     }
     BuildContext ctx = {0};
     ctx.log = on_log; ctx.progress = on_progress;

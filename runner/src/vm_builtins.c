@@ -40,6 +40,29 @@
 #include "gettime.h"
 #include "miniz.h"
 
+// Current time for the date/clock builtins. Test builds can pin it with BS_FAKE_TIME
+// ("YYYY-MM-DD HH:MM", local time) to exercise date-based events (e.g. Undertale's
+// October 10th encounter). Ignored on the Dreamcast, which uses its real-time clock.
+static time_t gmlNow(void) {
+#ifndef PLATFORM_DREAMCAST
+    static int parsed = 0;
+    static time_t offset = 0;
+    if (!parsed) {
+        parsed = 1;
+        const char* fake = getenv("BS_FAKE_TIME");
+        struct tm t = {0};
+        if (fake && sscanf(fake, "%d-%d-%d %d:%d", &t.tm_year, &t.tm_mon, &t.tm_mday, &t.tm_hour, &t.tm_min) == 5) {
+            t.tm_year -= 1900; t.tm_mon -= 1; t.tm_isdst = -1;
+            offset = mktime(&t) - time(NULL);
+        }
+    }
+    return time(NULL) + offset;
+#else
+    return time(NULL);
+#endif
+}
+
+
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 #endif
@@ -1087,7 +1110,7 @@ RValue VMBuiltins_getVariable(VMContext* ctx, Instance* inst, int16_t builtinVar
         case BUILTIN_VAR_CURRENT_SECOND:
         case BUILTIN_VAR_CURRENT_WEEKDAY:
         case BUILTIN_VAR_CURRENT_YEAR: {
-            time_t now = time(NULL);
+            time_t now = gmlNow();
             struct tm *t = localtime(&now);
             switch (builtinVarId) {
                 case BUILTIN_VAR_CURRENT_DAY:     return RValue_makeReal(t->tm_mday);
@@ -9924,7 +9947,11 @@ static RValue builtin_window_set_size(VMContext* ctx, RValue* args, MAYBE_UNUSED
 
     return RValue_makeUndefined();
 }
-STUB_RETURN_UNDEFINED(window_center)
+static RValue builtin_window_center(VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
+    Runner* runner = ctx->runner;
+    if (runner != nullptr && runner->centerWindow != nullptr) runner->centerWindow();
+    return RValue_makeUndefined();
+}
 
 static RValue builtin_window_set_caption(VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
     char* val = RValue_toString(args[0], ctx->runner->dataWin);
@@ -9978,12 +10005,14 @@ static RValue builtin_window_get_cursor(VMContext* ctx, MAYBE_UNUSED RValue* arg
 
 // ===[ Game State Functions ]===
 static RValue builtin_game_restart(VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
+    logInfo("Runner: game_restart() from %s (frame %d)\n", VM_getCurrentCallFrameCodeName(ctx), (int) ctx->runner->frameCount);
     ctx->runner->pendingRoom = ROOM_RESTARTGAME;
     return RValue_makeUndefined();
 }
 
 static RValue builtin_game_end(VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
     Runner* runner = ctx->runner;
+    logInfo("Runner: game_end() from %s (frame %d)\n", VM_getCurrentCallFrameCodeName(ctx), (int) runner->frameCount);
     runner->shouldExit = true;
     return RValue_makeUndefined();
 }
@@ -15177,7 +15206,7 @@ static RValue builtin_date_create_datetime(MAYBE_UNUSED VMContext* ctx, MAYBE_UN
 }
 
 static RValue builtin_date_current_datetime(MAYBE_UNUSED VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
-    return RValue_makeReal((double) time(NULL) / (double) 86400 + (double) 25569);
+    return RValue_makeReal((double) gmlNow() / (double) 86400 + (double) 25569);
 }
 
 static RValue builtin_date_get_year(VMContext* ctx, RValue* args, int32_t argCount) {

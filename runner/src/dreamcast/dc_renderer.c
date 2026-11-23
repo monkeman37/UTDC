@@ -24,18 +24,30 @@
 #include "utils.h"
 #include "log.h"
 #include "default_font/default_font.h"
+#include "data_win.h"
+#include "stb_ds.h"
 
 
 #define SCREEN_W 640.0f
 #define SCREEN_H 480.0f
 #define MAX_PRIM_VERTS 4096
+/* Each quad/triangle uses <= 160 bytes of the 384 KB TA vertex buffer; stay well inside it */
+#define DC_MAX_POLYS 2200
 #define DC_LZ4_IN_MAX (UTDC_TEX_BLOCK_RAW + UTDC_TEX_BLOCK_RAW / 255 + 64)
 
 typedef struct {
     pvr_ptr_t vram;
     uint32_t lastUsed;
     uint32_t bytes;
+    uint8_t* packed;        /* compressed payload kept in RAM after eviction (see PACKED_CACHE_BUDGET) */
+    uint32_t packedUse;     /* LRU stamp for the packed cache */
+    uint32_t retryFrame;    /* after a failed load, don't retry before this frame */
 } DcPageSlot;
+
+/* Compressed pages are small (typically 5-80 KB). Keeping recently used ones in RAM means that
+   going back and forth between a room and a battle doesn't hit the GD-ROM (seek time on real
+   hardware is far worse than the emulator suggests). */
+#define PACKED_CACHE_BUDGET (320 * 1024)
 
 typedef struct {
     Renderer base;
@@ -80,8 +92,25 @@ typedef struct {
     bool* surfaceAlive;
     int32_t currentTarget;
 
+    /* screen snapshots (sprite_create_from_surface on application_surface) */
+    uint32_t origTpagCount, origSpriteCount;
+
     DcRendererStats stats;
 } DcRenderer;
+
+/* A snapshot is a copy of the last displayed frame (or part of it) in a non-twiddled
+   ARGB1555 texture. The framebuffer is the game picture at 2x, so every other pixel is taken
+   and the texture holds the rect at half resolution. Snapshot "pages" use ids above the
+   TEXTURES.BIN page count. */
+typedef struct {
+    pvr_ptr_t vram;
+    uint16_t texW, texH;     /* power-of-two texture size */
+    float scale;             /* sprite pixels per texel (2) */
+    uint32_t freeAtFrame;    /* 0 = alive */
+    bool used;
+} DcSnapshot;
+static DcSnapshot* g_snaps;   /* stb array */
+static int32_t* g_tpagSnap;   /* stb array, index = tpag - origTpagCount */
 
 /* ===================================================================== */
 /* Texture cache                                                          */
@@ -107,15 +136,25 @@ static bool openTextures(DcRenderer* dc, const char* path) {
     return true;
 }
 
+static bool g_renderSynced; /* waited for the previous frame's render during this frame */
+
 static bool evictOne(DcRenderer* dc) {
     int32_t victim = -1;
     uint32_t oldest = 0xFFFFFFFFu;
-    for (uint32_t i = 0; i < dc->texHdr.pageCount; i++) {
-        DcPageSlot* s = &dc->slots[i];
-        if (!s->vram) continue;
-        /* Never evict pages used by this frame or the one the PVR may still be rendering */
-        if (s->lastUsed + 1 >= dc->frame) continue;
-        if (s->lastUsed < oldest) { oldest = s->lastUsed; victim = (int32_t) i; }
+    for (int pass = 0; pass < 2 && victim < 0; pass++) {
+        /* Pages used by this frame are never evicted. Pages used by the previous frame may
+           still be read by the PVR; only after waiting for that render to finish (pass 2,
+           needed on busy room/battle transitions) can they be reused. */
+        if (pass == 1) {
+            if (!g_renderSynced) { pvr_wait_render_done(); g_renderSynced = true; }
+        }
+        uint32_t keepFrom = pass == 0 ? dc->frame - 1 : dc->frame;
+        for (uint32_t i = 0; i < dc->texHdr.pageCount; i++) {
+            DcPageSlot* s = &dc->slots[i];
+            if (!s->vram) continue;
+            if (s->lastUsed >= keepFrom) continue;
+            if (s->lastUsed < oldest) { oldest = s->lastUsed; victim = (int32_t) i; }
+        }
     }
     if (victim < 0) return false;
     pvr_mem_free(dc->slots[victim].vram);
@@ -157,38 +196,73 @@ static int lz4DecodeBlock(const uint8_t* src, int srcLen, uint8_t* dst, int dstC
 
 /* Streams one page from disc into VRAM: each LZ4 block is decoded into a 32 KB RAM
    buffer and copied to VRAM with 32-bit stores (no store queues: they feed the TA). */
+static uint32_t g_packedBytes, g_packedClock;
+
+static void packedCacheTrim(DcRenderer* dc, uint32_t need) {
+    while (g_packedBytes + need > PACKED_CACHE_BUDGET) {
+        int32_t victim = -1; uint32_t oldest = 0xFFFFFFFFu;
+        for (uint32_t i = 0; i < dc->texHdr.pageCount; i++) {
+            DcPageSlot* s = &dc->slots[i];
+            if (s->packed && s->packedUse < oldest) { oldest = s->packedUse; victim = (int32_t) i; }
+        }
+        if (victim < 0) return;
+        free(dc->slots[victim].packed);
+        dc->slots[victim].packed = nullptr;
+        g_packedBytes -= (dc->pages[victim].compSize + 31) & ~31u;
+    }
+}
+
+/* Streams one page into VRAM: each LZ4 block is decoded into a 32 KB RAM buffer and sent to
+   VRAM with the store queues (pvr_txr_load). The SQ API saves/restores the TA destination, so
+   this is safe in the middle of a display list. */
 static bool uploadPage(DcRenderer* dc, uint32_t pageId, pvr_ptr_t dst) {
     UtdcTexPage* pg = &dc->pages[pageId];
-    /* One sector-aligned read for the whole payload lets the CD driver DMA it in a single command */
-    uint8_t* payload = (uint8_t*) memalign(32, (pg->compSize + 2047) & ~2047u);
-    if (!payload) return false;
-    if (fs_seek(dc->texFile, pg->offset, SEEK_SET) < 0 || fs_read(dc->texFile, payload, pg->compSize) != (ssize_t) pg->compSize) {
-        free(payload);
-        return false;
+    DcPageSlot* slot = &dc->slots[pageId];
+    uint8_t* payload = slot->packed;
+    bool fromCache = payload != nullptr;
+    if (!payload) {
+        /* One sector-aligned read for the whole payload lets the CD driver DMA it in a single command */
+        payload = (uint8_t*) memalign(32, (pg->compSize + 2047) & ~2047u);
+        if (!payload) {
+            /* low on RAM: make room by dropping cached packed pages, then retry once */
+            packedCacheTrim(dc, PACKED_CACHE_BUDGET);
+            payload = (uint8_t*) memalign(32, (pg->compSize + 2047) & ~2047u);
+        }
+        if (!payload) { logError("DC: no RAM to read page %u (%u bytes)\n", pageId, pg->compSize); return false; }
+        if (fs_seek(dc->texFile, pg->offset, SEEK_SET) < 0 || fs_read(dc->texFile, payload, pg->compSize) != (ssize_t) pg->compSize) {
+            logError("DC: read error on page %u\n", pageId);
+            free(payload);
+            return false;
+        }
     }
     uint32_t outTotal = (uint32_t) pg->width * pg->height * 2;
     uint32_t outPos = 0, inPos = 0;
-    volatile uint32_t* vram32 = (volatile uint32_t*) dst;
     bool ok = true;
     while (inPos < pg->compSize && outPos < outTotal) {
         UtdcTexBlock bh;
-        if (pg->compSize - inPos < sizeof bh) { ok = false; break; }
+        if (pg->compSize - inPos < sizeof bh) { logError("DC: truncated page %u\n", pageId); ok = false; break; }
         memcpy(&bh, payload + inPos, sizeof bh);
         inPos += sizeof bh;
-        if (bh.compSize > pg->compSize - inPos || bh.rawSize > UTDC_TEX_BLOCK_RAW || (bh.rawSize & 3)) { ok = false; break; }
+        if (bh.compSize > pg->compSize - inPos || bh.rawSize > UTDC_TEX_BLOCK_RAW || (bh.rawSize & 31)) { logError("DC: bad block header in page %u (%u/%u)\n", pageId, bh.compSize, bh.rawSize); ok = false; break; }
         int n = lz4DecodeBlock(payload + inPos, (int) bh.compSize, dc->dict, UTDC_TEX_BLOCK_RAW);
         inPos += bh.compSize;
         if (n != (int) bh.rawSize || outPos + (uint32_t) n > outTotal) { logError("DC: bad LZ4 block in page %u\n", pageId); ok = false; break; }
-        const uint32_t* src = (const uint32_t*) dc->dict;
-        volatile uint32_t* d = vram32 + outPos / 4;
-        for (int i = 0; i < n / 4; i += 8) {
-            d[i] = src[i]; d[i + 1] = src[i + 1]; d[i + 2] = src[i + 2]; d[i + 3] = src[i + 3];
-            d[i + 4] = src[i + 4]; d[i + 5] = src[i + 5]; d[i + 6] = src[i + 6]; d[i + 7] = src[i + 7];
-        }
+        pvr_txr_load(dc->dict, (uint8_t*) dst + outPos, (size_t) n);
         outPos += (uint32_t) n;
     }
-    free(payload);
     if (ok && outPos != outTotal) { logError("DC: page %u decoded %u of %u bytes\n", pageId, outPos, outTotal); ok = false; }
+    slot->packedUse = ++g_packedClock;
+    if (!fromCache) {
+        uint32_t keep = (pg->compSize + 31) & ~31u;
+        if (ok && keep <= PACKED_CACHE_BUDGET / 4) {
+            packedCacheTrim(dc, keep);
+            uint8_t* small = (uint8_t*) realloc(payload, keep); /* drop the sector padding */
+            slot->packed = small ? small : payload;
+            g_packedBytes += keep;
+        } else {
+            free(payload);
+        }
+    }
     return ok;
 }
 
@@ -197,6 +271,7 @@ static bool ensurePage(DcRenderer* dc, uint32_t pageId) {
     DcPageSlot* s = &dc->slots[pageId];
     s->lastUsed = dc->frame;
     if (s->vram) return true;
+    if (s->retryFrame > dc->frame) return false;
     UtdcTexPage* pg = &dc->pages[pageId];
     uint32_t bytes = (uint32_t) pg->width * pg->height * 2;
     pvr_ptr_t mem = nullptr;
@@ -204,7 +279,10 @@ static bool ensurePage(DcRenderer* dc, uint32_t pageId) {
         if (pvr_mem_available() >= bytes + 4096) mem = pvr_mem_malloc(bytes);
         if (mem) break;
         if (!evictOne(dc)) {
-            logWarn("DC: out of VRAM for page %u (%u bytes)\n", pageId, bytes);
+            uint32_t inUse = 0, inUseBytes = 0;
+            for (uint32_t i = 0; i < dc->texHdr.pageCount; i++) if (dc->slots[i].vram && dc->slots[i].lastUsed == dc->frame) { inUse++; inUseBytes += dc->slots[i].bytes; }
+            s->retryFrame = dc->frame + 1;
+            logWarn("DC: out of VRAM for page %u (%u bytes): %u pages (%u KB) in use this frame, %u KB free\n", pageId, bytes, inUse, inUseBytes / 1024, (unsigned) (pvr_mem_available() / 1024));
             return false;
         }
     }
@@ -219,6 +297,7 @@ static bool ensurePage(DcRenderer* dc, uint32_t pageId) {
     if (!ok) {
         logError("DC: failed to load texture page %u\n", pageId);
         pvr_mem_free(mem);
+        s->retryFrame = dc->frame + 30;
         return false;
     }
     s->vram = mem;
@@ -265,7 +344,13 @@ static void setState(DcRenderer* dc, int32_t pageId) {
     dc->curPage = pageId; dc->curSrc = src; dc->curDst = dst; dc->curFilter = filter;
 
     pvr_poly_cxt_t cxt;
-    if (pageId >= 0) {
+    if (pageId >= (int32_t) dc->texHdr.pageCount) {
+        DcSnapshot* sn = &g_snaps[pageId - (int32_t) dc->texHdr.pageCount];
+        pvr_poly_cxt_txr(&cxt, PVR_LIST_TR_POLY, PVR_TXRFMT_ARGB1555 | PVR_TXRFMT_NONTWIDDLED, sn->texW, sn->texH, sn->vram,
+                         filter ? PVR_FILTER_BILINEAR : PVR_FILTER_NONE);
+        cxt.txr.env = PVR_TXRENV_MODULATEALPHA;
+        cxt.txr.uv_clamp = PVR_UVCLAMP_UV;
+    } else if (pageId >= 0) {
         UtdcTexPage* pg = &dc->pages[pageId];
         int fmt = pg->format == UTDC_TEXFMT_ARGB4444 ? PVR_TXRFMT_ARGB4444 : (pg->format == UTDC_TEXFMT_RGB565 ? PVR_TXRFMT_RGB565 : PVR_TXRFMT_ARGB1555);
         pvr_poly_cxt_txr(&cxt, PVR_LIST_TR_POLY, fmt | PVR_TXRFMT_TWIDDLED, pg->width, pg->height, dc->slots[pageId].vram,
@@ -305,10 +390,16 @@ static inline void toScreen(DcRenderer* dc, float wx, float wy, float* sx, float
     *sy = wy * dc->scaleY + dc->offY;
 }
 
+/* Emulated window position (window_set_position): the whole picture is shifted on screen,
+   like the PC window moving on the desktop (Omega Flowey intro, genocide ending). */
+static float g_winDX, g_winDY;
+
+void DcRenderer_setWindowOffset(MAYBE_UNUSED Renderer* renderer, float dx, float dy) { g_winDX = dx; g_winDY = dy; }
+
 static inline void emitVertex(float x, float y, float u, float v, uint32_t argb, bool last) {
     pvr_vertex_t vert;
     vert.flags = last ? PVR_CMD_VERTEX_EOL : PVR_CMD_VERTEX;
-    vert.x = x; vert.y = y; vert.z = 1.0f;
+    vert.x = x + g_winDX; vert.y = y + g_winDY; vert.z = 1.0f;
     vert.u = u; vert.v = v;
     vert.argb = argb;
     vert.oargb = 0;
@@ -317,7 +408,7 @@ static inline void emitVertex(float x, float y, float u, float v, uint32_t argb,
 
 /* Emits a quad given 4 world-space corners in order TL, TR, BR, BL */
 static void emitQuad(DcRenderer* dc, int32_t pageId, const float* wx, const float* wy, const float* u, const float* v, const uint32_t* argb) {
-    if (!dc->inScene || dc->drawingToSurface) return;
+    if (!dc->inScene || dc->drawingToSurface || dc->stats.polysFrame >= DC_MAX_POLYS) return;
     float sx[4], sy[4];
     for (int i = 0; i < 4; i++) toScreen(dc, wx[i], wy[i], &sx[i], &sy[i]);
     float minX = fminf(fminf(sx[0], sx[1]), fminf(sx[2], sx[3]));
@@ -336,7 +427,7 @@ static void emitQuad(DcRenderer* dc, int32_t pageId, const float* wx, const floa
 }
 
 static void emitTriangle(DcRenderer* dc, int32_t pageId, const float* wx, const float* wy, const float* u, const float* v, const uint32_t* argb) {
-    if (!dc->inScene || dc->drawingToSurface) return;
+    if (!dc->inScene || dc->drawingToSurface || dc->stats.polysFrame >= DC_MAX_POLYS) return;
     float sx[3], sy[3];
     for (int i = 0; i < 3; i++) toScreen(dc, wx[i], wy[i], &sx[i], &sy[i]);
     setState(dc, pageId);
@@ -352,6 +443,16 @@ typedef struct { int32_t page; float u0, v0, u1, v1; } DcUV;
 
 static bool resolveUV(DcRenderer* dc, int32_t tpagIndex, float subX, float subY, float subW, float subH, DcUV* out) {
     DataWin* dw = dc->base.dataWin;
+    if (tpagIndex >= (int32_t) dc->origTpagCount && (uint32_t) tpagIndex < dw->tpag.count) {
+        int32_t k = tpagIndex - (int32_t) dc->origTpagCount;
+        if (k >= (int32_t) arrlen(g_tpagSnap) || g_tpagSnap[k] < 0) return false;
+        DcSnapshot* sn = &g_snaps[g_tpagSnap[k]];
+        float iw = 1.0f / ((float) sn->texW * sn->scale), ih = 1.0f / ((float) sn->texH * sn->scale);
+        out->page = (int32_t) dc->texHdr.pageCount + g_tpagSnap[k];
+        out->u0 = subX * iw; out->v0 = subY * ih;
+        out->u1 = (subX + subW) * iw; out->v1 = (subY + subH) * ih;
+        return true;
+    }
     if (tpagIndex < 0 || (uint32_t) tpagIndex >= dc->texHdr.itemCount || (uint32_t) tpagIndex >= dw->tpag.count) return false;
     UtdcTexItem* it = &dc->items[tpagIndex];
     if (it->page == UTDC_TEX_NO_PAGE) return false;
@@ -376,6 +477,7 @@ static bool resolveUV(DcRenderer* dc, int32_t tpagIndex, float subX, float subY,
 static void dcInit(Renderer* renderer, DataWin* dataWin) {
     DcRenderer* dc = (DcRenderer*) renderer;
     renderer->dataWin = dataWin;
+    dc->origSpriteCount = dataWin->sprt.count;
     renderer->drawColor = 0xFFFFFF;
     renderer->drawAlpha = 1.0f;
     renderer->drawFont = -1;
@@ -873,11 +975,142 @@ static void dcClearScreen(Renderer* renderer, uint32_t color, float alpha) {
     dc->blendEnabled = savedBlend;
 }
 
-static int32_t dcCreateSpriteFromSurface(MAYBE_UNUSED Renderer* renderer, MAYBE_UNUSED int32_t surfaceID, MAYBE_UNUSED int32_t x, MAYBE_UNUSED int32_t y, MAYBE_UNUSED int32_t w, MAYBE_UNUSED int32_t h, MAYBE_UNUSED bool removeback, MAYBE_UNUSED bool smooth, MAYBE_UNUSED int32_t xorig, MAYBE_UNUSED int32_t yorig) {
-    return -1;
+static uint32_t nextPow2(uint32_t v) { uint32_t p = 8; while (p < v) p <<= 1; return p; }
+
+static int32_t dcCreateSpriteFromSurface(Renderer* renderer, int32_t surfaceID, int32_t x, int32_t y, int32_t w, int32_t h, bool removeback, MAYBE_UNUSED bool smooth, int32_t xorig, int32_t yorig) {
+    DcRenderer* dc = (DcRenderer*) renderer;
+    DataWin* dw = renderer->dataWin;
+    if (surfaceID != APPLICATION_SURFACE_ID || w <= 0 || h <= 0) {
+        static int warned;
+        if (warned++ < 3) logInfo("DC: sprite_create_from_surface(%d, %d, %d, %d, %d) not supported\n", (int) surfaceID, (int) x, (int) y, (int) w, (int) h);
+        return -1;
+    }
+    uint64_t capT0 = timer_us_gettime64();
+
+    /* application_surface is the 640x480 window picture, i.e. the framebuffer (minus the
+       emulated window shake). Clip the rect, sample every other pixel. */
+    int32_t fx = x + (int32_t) g_winDX, fy = y + (int32_t) g_winDY;
+    uint32_t sw = (uint32_t) (w + 1) / 2, sh = (uint32_t) (h + 1) / 2;
+    if (sw > 512) sw = 512;
+    if (sh > 256) sh = 256;
+    uint32_t texW = nextPow2(sw), texH = nextPow2(sh);
+    uint32_t bytes = texW * texH * 2;
+    pvr_ptr_t mem = nullptr;
+    for (;;) {
+        if (pvr_mem_available() >= bytes + 4096) mem = pvr_mem_malloc(bytes);
+        if (mem) break;
+        if (!evictOne(dc)) { logWarn("DC: no VRAM for a %ux%u screen snapshot\n", texW, texH); return -1; }
+    }
+    uint32_t fbOff = PVR_GET(PVR_FB_ADDR) & 0x007FFFFFu;
+    /* Read the framebuffer through the cache (P1 mirror of the 32-bit VRAM area) so each 32-byte
+       line comes in one burst; invalidate first so no stale lines are used. */
+    const uint8_t* fbBase = (const uint8_t*) (0x85000000u + fbOff);
+    static uint16_t rowBuf[512] __attribute__((aligned(32)));
+    uint16_t key = 0;
+    bool haveKey = false;
+    uint32_t rowBytes = (sw * 2 + 31) & ~31u;
+    if (rowBytes > texW * 2) rowBytes = texW * 2;
+    for (uint32_t j = 0; j < sh; j++) {
+        int32_t sy = fy + (int32_t) j * 2;
+        memset(rowBuf, 0, sizeof rowBuf);
+        if (sy >= 0 && sy < 480) {
+            const uint8_t* line = fbBase + (uint32_t) sy * 1280u;
+            dcache_inval_range((uintptr_t) line & ~31u, 1280 + 32);
+            const uint16_t* src = (const uint16_t*) line;
+            int32_t i0 = fx < 0 ? (-fx + 1) / 2 : 0;
+            for (int32_t i = i0; i < (int32_t) sw; i++) {
+                int32_t sx = fx + i * 2;
+                if (sx >= 640) break;
+                uint16_t p565 = src[sx];
+                uint16_t c = (uint16_t) (0x8000 | ((p565 >> 1) & 0x7FE0) | (p565 & 0x1F)); /* RGB565 -> ARGB1555 */
+                if (removeback) {
+                    if (!haveKey) { key = c; haveKey = true; }
+                    if (c == key) c = 0;
+                }
+                rowBuf[i] = c;
+            }
+        }
+        uint8_t* dstRow = (uint8_t*) mem + j * texW * 2;
+        if (rowBytes >= 32) pvr_txr_load(rowBuf, dstRow, rowBytes);
+        else { volatile uint32_t* d = (volatile uint32_t*) dstRow; for (uint32_t i = 0; i < texW / 2; i++) d[i] = (uint32_t) rowBuf[2 * i] | ((uint32_t) rowBuf[2 * i + 1] << 16); }
+    }
+
+    {
+        static uint32_t capCount;
+        if ((capCount++ % 60) == 0)
+            logInfo("DC: screen snapshot %dx%d at (%d,%d) took %u us\n", (int) w, (int) h, (int) x, (int) y, (unsigned) (timer_us_gettime64() - capT0));
+    }
+    /* snapshot slot */
+    int32_t snapIdx = -1;
+    for (int32_t k = 0; k < (int32_t) arrlen(g_snaps); k++) if (!g_snaps[k].used) { snapIdx = k; break; }
+    if (snapIdx < 0) { DcSnapshot z = {0}; arrput(g_snaps, z); snapIdx = (int32_t) arrlen(g_snaps) - 1; }
+    DcSnapshot* sn = &g_snaps[snapIdx];
+    sn->vram = mem; sn->texW = (uint16_t) texW; sn->texH = (uint16_t) texH; sn->scale = 2.0f; sn->freeAtFrame = 0; sn->used = true;
+
+    /* synthetic TPAG */
+    uint32_t tpagIndex = 0xFFFFFFFFu;
+    for (uint32_t i = dc->origTpagCount; i < dw->tpag.count; i++) {
+        int32_t k = (int32_t) (i - dc->origTpagCount);
+        if (k < (int32_t) arrlen(g_tpagSnap) && g_tpagSnap[k] < 0) { tpagIndex = i; break; }
+    }
+    if (tpagIndex == 0xFFFFFFFFu) {
+        tpagIndex = dw->tpag.count++;
+        dw->tpag.items = (TexturePageItem*) safeRealloc(dw->tpag.items, dw->tpag.count * sizeof(TexturePageItem));
+        int32_t none = -1;
+        while ((int32_t) arrlen(g_tpagSnap) <= (int32_t) (tpagIndex - dc->origTpagCount)) arrput(g_tpagSnap, none);
+    }
+    TexturePageItem* tp = &dw->tpag.items[tpagIndex];
+    memset(tp, 0, sizeof *tp);
+    tp->sourceWidth = tp->targetWidth = tp->boundingWidth = (uint16_t) w;
+    tp->sourceHeight = tp->targetHeight = tp->boundingHeight = (uint16_t) h;
+    tp->texturePageId = 0;
+    g_tpagSnap[tpagIndex - dc->origTpagCount] = snapIdx;
+
+    uint32_t spriteIndex = DataWin_allocSpriteSlot(dw, dc->origSpriteCount);
+    Sprite* sprite = &dw->sprt.sprites[spriteIndex];
+    sprite->width = (uint32_t) w;
+    sprite->height = (uint32_t) h;
+    sprite->originX = xorig;
+    sprite->originY = yorig;
+    sprite->textureCount = 1;
+    sprite->tpagIndices = (int32_t*) safeMalloc(sizeof(int32_t));
+    sprite->tpagIndices[0] = (int32_t) tpagIndex;
+    sprite->maskCount = 0;
+    sprite->masks = nullptr;
+    return (int32_t) spriteIndex;
 }
 
-static void dcDeleteSprite(MAYBE_UNUSED Renderer* renderer, MAYBE_UNUSED int32_t spriteIndex) {}
+static void dcDeleteSprite(Renderer* renderer, int32_t spriteIndex) {
+    DcRenderer* dc = (DcRenderer*) renderer;
+    DataWin* dw = renderer->dataWin;
+    if (spriteIndex < (int32_t) dc->origSpriteCount || (uint32_t) spriteIndex >= dw->sprt.count) return;
+    Sprite* sprite = &dw->sprt.sprites[spriteIndex];
+    if (sprite->textureCount == 0) return;
+    for (uint32_t i = 0; i < sprite->textureCount; i++) {
+        int32_t t = sprite->tpagIndices[i];
+        if (t < (int32_t) dc->origTpagCount) continue;
+        int32_t k = t - (int32_t) dc->origTpagCount;
+        if (k < (int32_t) arrlen(g_tpagSnap) && g_tpagSnap[k] >= 0) {
+            /* the PVR may still be drawing it: free two frames later */
+            g_snaps[g_tpagSnap[k]].freeAtFrame = dc->frame + 2;
+            g_tpagSnap[k] = -1;
+        }
+    }
+    free(sprite->tpagIndices);
+    const char* keepName = sprite->name;
+    memset(sprite, 0, sizeof(Sprite));
+    sprite->name = keepName;
+}
+
+static void freeOldSnapshots(DcRenderer* dc) {
+    for (int32_t k = 0; k < (int32_t) arrlen(g_snaps); k++) {
+        DcSnapshot* sn = &g_snaps[k];
+        if (sn->used && sn->freeAtFrame && dc->frame >= sn->freeAtFrame) {
+            pvr_mem_free(sn->vram);
+            sn->vram = nullptr; sn->used = false; sn->freeAtFrame = 0;
+        }
+    }
+}
 
 static BlendFactors dcGpuGetBlendFactors(Renderer* renderer) { return renderer->blendFactors; }
 
@@ -1024,6 +1257,7 @@ Renderer* DcRenderer_create(const char* texturesPath) {
         free(dc);
         return nullptr;
     }
+    dc->origTpagCount = dc->texHdr.itemCount;
     /* 8x8 white texture */
     dc->whiteTex = pvr_mem_malloc(8 * 8 * 2);
     volatile uint16_t* w = (volatile uint16_t*) dc->whiteTex;
@@ -1077,6 +1311,8 @@ Renderer* DcRenderer_create(const char* texturesPath) {
 void DcRenderer_beginScene(Renderer* renderer) {
     DcRenderer* dc = (DcRenderer*) renderer;
     dc->frame++;
+    g_renderSynced = false;
+    freeOldSnapshots(dc);
     dc->stats.pageLoadsFrame = 0;
     dc->stats.polysFrame = 0;
     pvr_wait_ready();

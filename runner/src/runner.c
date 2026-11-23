@@ -1,4 +1,7 @@
 #include "runner.h"
+#ifdef PLATFORM_DREAMCAST
+#include <arch/timer.h>
+#endif
 #include "vm_builtins.h"
 #include "physics/physics.h"
 #include "data_win.h"
@@ -1669,7 +1672,13 @@ static void initRoom(Runner* runner, int32_t roomIndex) {
 
     // Lazy-room load: if the payload wasn't loaded, read it from the data.win file now before anything touches the room's game objects/tiles/layers.
     if (!room->payloadLoaded) {
+#ifdef PLATFORM_DREAMCAST
+        uint64_t lt0 = timer_us_gettime64();
         DataWin_loadRoomPayload(dataWin, roomIndex);
+        logInfo("DC: room payload %s read in %u ms\n", room->name, (unsigned) ((timer_us_gettime64() - lt0) / 1000));
+#else
+        DataWin_loadRoomPayload(dataWin, roomIndex);
+#endif
     }
 
     SavedRoomState* savedState = &runner->savedRoomStates[roomIndex];
@@ -4258,7 +4267,24 @@ void Runner_handlePendingRoomChange(Runner* runner) {
 
         // Free the outgoing room's payload after Cleanup and persistent-instance layer transfer.
         if (runner->dataWin->lazyLoadRooms && !oldRoom->eagerlyLoaded && newRoomIndex != oldRoomIndex) {
+#ifdef PLATFORM_DREAMCAST
+            // Keep the last few rooms parsed: walking back through a door or returning from a
+            // battle then needs no disc access (a GD-ROM seek costs ~250 ms).
+            static int32_t recentRooms[3] = { -1, -1, -1 };
+            int32_t evict = recentRooms[2];
+            bool already = false;
+            for (int k = 0; k < 3; k++) if (recentRooms[k] == oldRoomIndex) already = true;
+            if (!already) {
+                recentRooms[2] = recentRooms[1]; recentRooms[1] = recentRooms[0]; recentRooms[0] = oldRoomIndex;
+                if (evict >= 0 && evict != newRoomIndex && (uint32_t) evict < runner->dataWin->room.count) {
+                    Room* er = &runner->dataWin->room.rooms[evict];
+                    if (er->payloadLoaded && !er->eagerlyLoaded) DataWin_freeRoomPayload(er);
+                }
+            }
+            for (int k = 0; k < 3; k++) if (recentRooms[k] == newRoomIndex) recentRooms[k] = -2; // now current
+#else
             DataWin_freeRoomPayload(oldRoom);
+#endif
         }
 
         // Fire Room Start for all instances

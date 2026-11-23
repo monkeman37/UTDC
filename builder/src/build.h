@@ -22,6 +22,8 @@ typedef struct {
     const char* testInputs;  /* Butterscotch input-playback JSON copied to the disc as INPUT.JSN */
     int         overlay;     /* show the fps/timing overlay */
     int         exitFrame;   /* quit to BIOS after this game frame (0 = never) */
+    const char* extraCfg[16]; /* extra KEY=VALUE lines for UTDC.CFG (test harness) */
+    int         extraCfgCount;
 } BuildOptions;
 
 typedef void (*BuildLogFn)(void* user, const char* line);

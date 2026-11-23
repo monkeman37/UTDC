@@ -22,6 +22,7 @@ Renderer* DcRenderer_create(const char* texturesPath);
 /* Called by the platform loop around Runner_draw*. */
 void DcRenderer_beginScene(Renderer* renderer);
 void DcRenderer_endScene(Renderer* renderer);
+void DcRenderer_setWindowOffset(Renderer* renderer, float dx, float dy);
 
 /* Draws a solid rectangle in screen space (debug overlay / loading screen helpers). */
 void DcRenderer_screenRect(Renderer* renderer, float x0, float y0, float x1, float y1, uint32_t argb);

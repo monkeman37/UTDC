@@ -1691,9 +1691,9 @@ static void handleConv(VMContext* ctx, uint8_t srcType, uint8_t dstType, uint8_t
         case 0x23: result = RValue_makeInt32((int32_t) val.int64); break;
         case 0x43: result = RValue_makeBool(val.int64 > 0); break;
         case 0x53: result = val; break; // Int64 -> Variable (passthrough)
-#elif IS_WAD17_OR_HIGHER_ENABLED
+#else
         // Int64 (3) -> other (Int64 stored as Int32 when NO_RVALUE_INT64).
-        // Only emitted on BC17+ builds: BC16 games (Undertale, SURVEY_PROGRAM) never emit Int64 Conv opcodes.
+        // Undertale (BC16) does emit these, e.g. obj_backgrounder_dock (Waterfall docks).
         case 0x03: result = RValue_makeReal((GMLReal) val.int32); break;
         case 0x23: result = val; break; // Already Int32
         case 0x43: result = RValue_makeBool(val.int32 > 0); break;
