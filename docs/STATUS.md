@@ -2,7 +2,7 @@
 
 ## Working (verified in Flycast)
 
-- Boot from GD-ROM image, loading screen, VMU detection
+- Boot from GD-ROM image, loading screen, VMU detection; boot to the intro takes ~10 s (data.win chunks are read with one sector-aligned request each; the per-script bytecode packing reuses one compressor)
 - Full asset pipeline: 6,550 texture items → 584 PVR pages (256x256, so a frame only keeps the parts of an atlas it uses in VRAM), 264 sound effects, 179 streams (music + long effects), all at the original 44.1 kHz
 - Rendering: sprites (scaled/rotated/coloured), tiles, backgrounds, text with gradients, rectangles,
   lines, primitives, blend modes, views/ports

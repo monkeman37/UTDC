@@ -9,6 +9,23 @@
 #include "utils.h"
 #include "miniz.h"
 
+/* growable output buffer for tdefl (miniz keeps its own one private) */
+typedef struct { size_t m_size, m_capacity; mz_uint8* m_pBuf; mz_bool m_expandable; } BcOut;
+static mz_bool bcPutter(const void* pBuf, int len, void* pUser) {
+    BcOut* p = (BcOut*) pUser;
+    size_t need = p->m_size + (size_t) len;
+    if (need > p->m_capacity) {
+        size_t cap = p->m_capacity ? p->m_capacity : 128;
+        while (cap < need) cap *= 2;
+        mz_uint8* nb = (mz_uint8*) realloc(p->m_pBuf, cap);
+        if (!nb) return MZ_FALSE;
+        p->m_pBuf = nb; p->m_capacity = cap;
+    }
+    memcpy(p->m_pBuf + p->m_size, pBuf, (size_t) len);
+    p->m_size = need;
+    return MZ_TRUE;
+}
+
 typedef struct {
     bool active;
     uint32_t count;
@@ -68,6 +85,12 @@ bool BytecodeCache_compressAll(DataWin* dw, uint32_t cacheBudgetBytes, int level
     g_cache.budget = cacheBudgetBytes;
 
     mz_uint flags = tdefl_create_comp_flags_from_zip_params(level, -MZ_DEFAULT_WINDOW_BITS, MZ_DEFAULT_STRATEGY);
+    /* One compressor for all entries. NONDETERMINISTIC skips clearing its 64 KB hash and 32 KB
+       dictionary for every one of the ~6000 scripts (which took ~7 s on the Dreamcast); matches
+       are still limited to the current entry's own history, so the output stays valid. */
+    flags |= TDEFL_NONDETERMINISTIC_PARSING_FLAG;
+    tdefl_compressor* comp = (tdefl_compressor*) malloc(sizeof(tdefl_compressor));
+    if (!comp) { logError("BytecodeCache: no memory for the compressor\n"); abort(); }
     uint8_t* buf = dw->bytecodeBuffer;
     size_t base = dw->bytecodeBufferBase;
     size_t keep = (size_t) -1;          /* bytes of the blob still needed */
@@ -77,7 +100,26 @@ bool BytecodeCache_compressAll(DataWin* dw, uint32_t cacheBudgetBytes, int level
         CodeEntry* c = &dw->code.entries[idx];
         size_t rel = c->bytecodeAbsoluteOffset - base;
         size_t outLen = 0;
-        void* out = tdefl_compress_mem_to_heap(buf + rel, c->length, &outLen, (int) flags);
+        BcOut ob;
+        memset(&ob, 0, sizeof ob);
+        ob.m_expandable = MZ_TRUE;
+        ob.m_capacity = c->length + c->length / 8 + 64;
+        ob.m_pBuf = (mz_uint8*) malloc(ob.m_capacity);
+        void* out = nullptr;
+        if (ob.m_pBuf && tdefl_init(comp, bcPutter, &ob, (int) flags) == TDEFL_STATUS_OKAY &&
+            tdefl_compress_buffer(comp, buf + rel, c->length, TDEFL_FINISH) == TDEFL_STATUS_DONE) {
+            outLen = ob.m_size;
+            out = realloc(ob.m_pBuf, outLen ? outLen : 1);
+            if (!out) out = ob.m_pBuf;
+        } else {
+            free(ob.m_pBuf);
+        }
+        if (out && getenv("BS_VERIFY_BYTECODE")) {
+            uint8_t* chk = (uint8_t*) malloc(c->length ? c->length : 1);
+            size_t n = tinfl_decompress_mem_to_mem(chk, c->length, out, outLen, 0);
+            if (n != c->length || memcmp(chk, buf + rel, c->length) != 0) { logError("BytecodeCache: verify failed for entry %d\n", idx); abort(); }
+            free(chk);
+        }
         if (!out) {
             logError("BytecodeCache: out of memory while compressing entry %d\n", idx);
             abort();
@@ -95,6 +137,7 @@ bool BytecodeCache_compressAll(DataWin* dw, uint32_t cacheBudgetBytes, int level
             lastShrink = keep;
         }
     }
+    free(comp);
     free(buf);
     free(order);
     dw->bytecodeBuffer = nullptr;

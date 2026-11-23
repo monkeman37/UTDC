@@ -76,9 +76,17 @@ static void fatal(const char* line1, const char* line2) {
 }
 
 static const char* g_loadTitle = "Loading";
+static uint64_t g_bootT0, g_bootLast;
+/* boot profiling: logs time spent since the previous mark */
+static void bootMark(const char* what) {
+    uint64_t now = timer_us_gettime64();
+    logInfo("DC: boot %-24s %5u ms (total %u ms)\n", what, (unsigned) ((now - g_bootLast) / 1000), (unsigned) ((now - g_bootT0) / 1000));
+    g_bootLast = now;
+}
 static void loadProgress(const char* chunkName, int chunkIndex, int totalChunks, MAYBE_UNUSED DataWin* dw, MAYBE_UNUSED void* user) {
     char line[64];
     snprintf(line, sizeof line, "Reading game data (%s)", chunkName);
+    { char m[32]; snprintf(m, sizeof m, "before chunk %s", chunkName); bootMark(m); }
     textScreen(g_loadTitle, line, nullptr, totalChunks > 0 ? (float) chunkIndex / (float) totalChunks : 0);
 }
 
@@ -244,6 +252,7 @@ static void dcCenterWindow(void) { dcSetWindowPosition(WIN_BASE_X, WIN_BASE_Y); 
 
 int main(MAYBE_UNUSED int argc, MAYBE_UNUSED char** argv) {
     vid_set_mode(DM_640x480, PM_RGB565);
+    g_bootT0 = g_bootLast = timer_us_gettime64();
     textScreen("UNDERTALE for Dreamcast", "Starting...", nullptr, 0);
 
     /* log what the CD driver sees (helps diagnose bad disc images) */
@@ -306,8 +315,10 @@ int main(MAYBE_UNUSED int argc, MAYBE_UNUSED char** argv) {
     options.loadType = DATAWINLOADTYPE_LOAD_PER_CHUNK;
     options.progressCallback = loadProgress;
 
+    bootMark("startup");
     DataWin* dataWin = DataWin_parse(DISC_ROOT "/DATA.WIN", options);
     if (!dataWin) fatal("Could not read DATA.WIN from the disc.", "Rebuild the image with the UTDC wizard.");
+    bootMark("data.win parsed");
     DcTextPatches_apply(dataWin);
     {
         struct mallinfo mi = mallinfo();
@@ -332,24 +343,30 @@ int main(MAYBE_UNUSED int argc, MAYBE_UNUSED char** argv) {
     if (pvr_init(&params) < 0) fatal("Could not initialise the PowerVR.", nullptr);
     pvr_set_bg_color(0, 0, 0);
 
+    bootMark("pvr init");
     Renderer* renderer = DcRenderer_create(DISC_ROOT "/TEXTURES.BIN");
     if (!renderer) fatal("Could not read TEXTURES.BIN from the disc.", nullptr);
 
     FileSystem* fileSystem = DcFileSystem_create(dataWin->gen8.displayName, DISC_ROOT);
 
+    bootMark("renderer + VMU");
     snd_init();
     AudioSystem* audioSystem = DcAudioSystem_create(DISC_ROOT "/AUDIO.BIN");
     if (!audioSystem) fatal("Could not read AUDIO.BIN from the disc.", nullptr);
 
+    bootMark("audio");
     VMContext* vm = VM_create(dataWin);
     textScreen(title, "Packing game code...", nullptr, 1.0f);
     /* Deflate the patched bytecode per script and keep a 1 MB cache of decompressed scripts:
        saves roughly 3-4 MB of the Dreamcast's 16 MB. */
+    bootMark("VM create");
     BytecodeCache_compressAll(dataWin, 1024 * 1024, 3);
     /* Like GameMaker on PC, start with a random seed (clock + boot timing), so values such as
        the FUN value rolled at the start of a new game differ between playthroughs. */
     uint32_t bootSeed = ((uint32_t) time(NULL) * 2654435761u) ^ (uint32_t) timer_us_gettime64();
+    bootMark("bytecode packed");
     Runner* runner = Runner_create(dataWin, vm, renderer, fileSystem, audioSystem, bootSeed);
+    bootMark("runner create");
     {
         struct mallinfo mi = mallinfo();
         logInfo("DC: runner created, heap in use %d KB, free RAM %u KB, VRAM free %d KB\n", mi.uordblks / 1024, freeRamKB(), (int) (pvr_mem_available() / 1024));
@@ -378,6 +395,7 @@ int main(MAYBE_UNUSED int argc, MAYBE_UNUSED char** argv) {
 
     vblank_handler_add(onVblank, nullptr);
     Runner_initFirstRoom(runner);
+    bootMark("first room");
 
     Gen8* gen8 = &dataWin->gen8;
     int32_t gameW = (int32_t) gen8->defaultWindowWidth;

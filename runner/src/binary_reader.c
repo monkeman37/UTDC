@@ -1,3 +1,7 @@
+#ifdef PLATFORM_DREAMCAST
+#include <malloc.h>
+#include <unistd.h>
+#endif
 #include "binary_reader.h"
 #include "binary_utils.h"
 #include "utils.h"
@@ -120,6 +124,25 @@ uint8_t* BinaryReader_readBytesAt(BinaryReader* reader, size_t offset, size_t co
     }
 
     long savedPos = ftell(reader->file);
+#ifdef PLATFORM_DREAMCAST
+    // Big reads (e.g. the 2.8 MB string table): one sector-aligned request instead of newlib's
+    // buffered path, which splits it into many small GD-ROM reads.
+    if (count >= 64 * 1024) {
+        size_t a0 = offset & ~(size_t) 2047, a1 = (offset + count + 2047) & ~(size_t) 2047;
+        if (a1 > reader->fileSize) a1 = reader->fileSize;
+        uint8_t* tmp = (uint8_t*) memalign(32, a1 - a0);
+        int fd = fileno(reader->file);
+        bool ok = tmp && lseek(fd, (off_t) a0, SEEK_SET) == (off_t) a0 && read(fd, tmp, a1 - a0) == (ssize_t) (a1 - a0);
+        if (ok) {
+            free(buf);
+            memmove(tmp, tmp + (offset - a0), count);
+            uint8_t* shrunk = (uint8_t*) realloc(tmp, count);
+            fseek(reader->file, savedPos, SEEK_SET);
+            return shrunk ? shrunk : tmp;
+        }
+        free(tmp);
+    }
+#endif
     fseek(reader->file, (long) offset, SEEK_SET);
     readCheck(reader, buf, count);
     fseek(reader->file, savedPos, SEEK_SET);

@@ -3088,7 +3088,13 @@ DataWin* DataWin_parse(const char* filePath, DataWinParserOptions options) {
     // Use a large read buffer to reduce the number of physical reads
     // This is critical for slow I/O devices like the PS2 CDVD drive, where each fread
     // call would otherwise trigger a separate disc read of just a few sectors
+#ifdef PLATFORM_DREAMCAST
+    // Chunk payloads are read directly from the descriptor (see below); stdio only serves the
+    // 8-byte chunk headers, and a big buffer would pull 128 KB off the GD-ROM for each of them.
+    setvbuf(file, nullptr, _IOFBF, 2048);
+#else
     setvbuf(file, nullptr, _IOFBF, 128 * 1024);
+#endif
 
     fseek(file, 0, SEEK_END);
     long fileSizeRaw = ftell(file);
@@ -3244,9 +3250,28 @@ DataWin* DataWin_parse(const char* filePath, DataWinParserOptions options) {
         // Bulk-read the chunk data into memory for fast parsing
         uint8_t* chunkBuffer = nullptr;
         if (shouldParse && chunkLength > 0 && options.loadType == DATAWINLOADTYPE_LOAD_PER_CHUNK) {
+#ifdef PLATFORM_DREAMCAST
+            // One sector-aligned read straight from the descriptor (newlib's buffered fread turns
+            // a multi-MB chunk into thousands of small GD-ROM requests), then slide the data down
+            // so the buffer can still be freed or handed over to a parser.
+            uint32_t a0 = chunkDataStart & ~2047u;
+            uint32_t a1 = (chunkDataStart + chunkLength + 2047u) & ~2047u;
+            if (a1 > fileSize) a1 = (uint32_t) fileSize;
+            chunkBuffer = (uint8_t *)memalign(32, a1 - a0);
+            if (chunkBuffer) {
+                int fd = fileno(reader.file);
+                size_t got = 0;
+                if (lseek(fd, (off_t) a0, SEEK_SET) == (off_t) a0 && read(fd, chunkBuffer, a1 - a0) == (ssize_t) (a1 - a0)) {
+                    memmove(chunkBuffer, chunkBuffer + (chunkDataStart - a0), chunkLength);
+                    got = chunkLength;
+                }
+                size_t read = got;
+                fseek(reader.file, (long) (chunkDataStart + chunkLength), SEEK_SET);
+#else
             chunkBuffer = (uint8_t *)malloc(chunkLength);
             if (chunkBuffer) {
                 size_t read = fread(chunkBuffer, 1, chunkLength, reader.file);
+#endif
                 if (read != chunkLength) {
                     logError("DataWin: short read on chunk %.4s (expected %u, got %zu)\n", chunkName, chunkLength, read);
                     exit(1);
