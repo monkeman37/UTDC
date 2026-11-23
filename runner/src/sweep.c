@@ -1,5 +1,5 @@
 // Automated coverage sweep used by the UTDC test harness (CLI builds only, enabled by env vars).
-//   BS_SWEEP_MODE   = rooms | battles | objects (instance_create the listed objects)
+//   BS_SWEEP_MODE   = rooms | battles | objects (instance_create the listed objects) | sounds (play each sound once)
 //   BS_SWEEP_LIST   = comma separated room indices / battle groups
 //   BS_SWEEP_START  = index into the list to start from (default 0)
 //   BS_SWEEP_BOOT   = frame at which the sweep starts (default 400)
@@ -21,6 +21,7 @@ static int g_mode = -1; // 0 rooms, 1 battles
 static int* g_list;
 static int g_count, g_pos, g_boot = 400, g_frames = 300, g_next;
 static uint32_t g_rng = 12345;
+static int32_t g_soundId = -1, g_itemStart = 0;
 
 static uint32_t rnd(void) { g_rng = g_rng * 1103515245u + 12345u; return g_rng >> 16; }
 
@@ -36,7 +37,7 @@ static RValue getGlobal(Runner* runner, const char* name) {
 static void init(void) {
     const char* m = getenv("BS_SWEEP_MODE");
     if (m == nullptr) { g_mode = -2; return; }
-    g_mode = strcmp(m, "battles") == 0 ? 1 : strcmp(m, "objects") == 0 ? 2 : 0;
+    g_mode = strcmp(m, "battles") == 0 ? 1 : strcmp(m, "objects") == 0 ? 2 : strcmp(m, "sounds") == 0 ? 3 : 0;
     const char* l = getenv("BS_SWEEP_LIST");
     for (const char* p = l ? l : ""; *p;) {
         char* end; long v = strtol(p, &end, 10);
@@ -71,6 +72,12 @@ void Sweep_tick(Runner* runner) {
                 setGlobal(runner, "interact", RValue_makeInt32(0));
                 runner->pendingRoom = item;
             }
+        } else if (g_mode == 3) {
+            runner->audioSystem->vtable->stopAll(runner->audioSystem);
+            int32_t id = runner->audioSystem->vtable->playSound(runner->audioSystem, item, 50, false);
+            g_soundId = id; g_itemStart = frame;
+            logInfo("SWEEP: item %d sound %d %s -> instance %d (frame %d)\n", g_pos - 1, item,
+                    (uint32_t) item < runner->dataWin->sond.count ? runner->dataWin->sond.sounds[item].name : "?", (int) id, frame);
         } else if (g_mode == 2) {
             if (item >= 0 && (uint32_t) item < runner->dataWin->objt.count) {
                 logInfo("SWEEP: item %d object %d %s (frame %d)\n", g_pos - 1, item, runner->dataWin->objt.objects[item].name, frame);
@@ -84,6 +91,11 @@ void Sweep_tick(Runner* runner) {
             repeat(runner->dataWin->room.count, i) if (strcmp(runner->dataWin->room.rooms[i].name, "room_battle") == 0) battleRoom = (int32_t) i;
             if (battleRoom >= 0) runner->pendingRoom = battleRoom;
         }
+    }
+    // BS_SWEEP_PAUSETEST: pause each played sound 3 s in, resume it 2 s later (music pause/resume check)
+    if (g_mode == 3 && g_soundId >= 0 && getenv("BS_SWEEP_PAUSETEST")) {
+        if (frame == g_itemStart + 90) { runner->audioSystem->vtable->pauseSound(runner->audioSystem, g_soundId); logInfo("SWEEP: paused %d\n", g_soundId); }
+        if (frame == g_itemStart + 150) { runner->audioSystem->vtable->resumeSound(runner->audioSystem, g_soundId); logInfo("SWEEP: resumed %d\n", g_soundId); }
     }
     // keep the player alive in battles
     if (g_mode == 1) {

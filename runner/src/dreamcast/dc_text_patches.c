@@ -34,9 +34,36 @@ static const TextPatch PATCHES[] = {
     { "[X / SHIFT]", "[B]", false },
     { "[C / CTRL]", "[Y]", false },
     { "[ESC\xE3\x81\xAA\xE3\x81\x8C\xE3\x81\x8A\xE3\x81\x97]", "[ABXY+START]", false },
-    /* in-game tutorial line that names the keyboard key for the menu */
-    { "THE [ C ] KEY ON&YOUR KEYBOARD FOR", "THE [ Y ] BUTTON&ON YOUR PAD FOR", true },
+    /* What the game's button macro (\\*Z, \\*X, \\*C in dialogue, e.g. "Press \\*C to open the
+       menu" after taking a candy) expands to on PC: scr_replace_buttons_pc swaps it for these
+       three strings, which nothing else uses. Covers every such prompt in both languages. */
+    { "[Z]", "[A]", false },
+    { "[X]", "[B]", false },
+    { "[C]", "[Y]", false },
+    /* Japanese: "arrow keys" -> "D-pad" (the usual Dreamcast term) */
+    { "\xE3\x82\x84\xE3\x81\x98\xE3\x82\x8B\xE3\x81\x97\xE3\x82\xAD\xE3\x83\xBC", "\xE5\x8D\x81\xE5\xAD\x97\xE3\x82\xAD\xE3\x83\xBC", true },
 };
+
+/* Lines that exist in a PC and a console version in the game's own text tables. On the
+   Dreamcast the PC key is given the console text (taken from the user's data at load time). */
+static const struct { const char* consoleKey; const char* pcKey; } ALIASES[] = {
+    /* Papyrus date/hangout: "press the C key on your keyboard" -> "press your controller's [Y] button" */
+    { "obj_papdate_206", "obj_papdate_204" },
+    { "obj_papdate_207", "obj_papdate_205" },
+    /* Toriel's phone call mentions using the computer -> playing video games */
+    { "scr_torcall_129_console", "scr_torcall_129" },
+    { "scr_torcall_130_console", "scr_torcall_130" },
+};
+
+const char* DcTextPatches_aliasFor(const char* key) {
+    if (key == nullptr || key[0] < 'o' || key[0] > 's') return nullptr; /* fast reject */
+    for (size_t i = 0; i < sizeof ALIASES / sizeof ALIASES[0]; i++)
+        if (strcmp(key, ALIASES[i].consoleKey) == 0) {
+            logInfo("DC: text '%s' uses the console version\n", ALIASES[i].pcKey);
+            return ALIASES[i].pcKey;
+        }
+    return nullptr;
+}
 
 /* Stores 'text' as entry i: in place if it fits (keeps the GameMaker length prefix
    right), otherwise in a new length-prefixed allocation. */

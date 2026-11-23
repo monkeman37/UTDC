@@ -8,6 +8,7 @@
   lines, primitives, blend modes, views/ports
 - Input (controller → keyboard emulation), naming screen, menus, overworld, battle
 - Music streaming with looping, sound effects; playback speed/pitch matches the PC version (no 22 kHz downsampling, no truncated long effects, live music pitch changes)
+- Streams are decoded from ADPCM to PCM on the SH-4, so pause/resume (e.g. room music during a battle), pitch changes and loops are exact and one-shot streams play to their end; sound effects get 40 reserved AICA channels so frequent text blips no longer cut off longer effects (Flowey's laugh). All 443 sounds were played back automatically and checked against their length
 - VMU saves: real SAVE point → reboot → Continue screen shows the file → Continue returns to the save point (tests/save.txt, tests/cont.txt). Saves alternate between two VMU files so an interrupted write never loses the previous save
 - Locked 30 fps in every tested scene
 - Automated sweeps (see TESTING.md): all 336 rooms and all 113 battle groups run without VM errors on the PC build; all battle groups run on the Dreamcast build in Flycast
@@ -18,6 +19,7 @@
 - Date/time events use the Dreamcast's clock (set it in the BIOS); the random seed comes from the clock and boot timing, so the FUN value differs between new games
 - `sprite_create_from_surface(application_surface)` (screen snapshots used by the heat-shimmer, elevator and post-Flowey effects) copies the last displayed frame
 - Dreamcast keyboard: works like the PC keyboard, including typing (Mettaton's essay)
+- Button prompts: the game's own button macro (`\*Z`/`\*X`/`\*C`, used for every "press ... " hint in dialogue) shows [A]/[B]/[Y]; Papyrus's date HUD prompt and Toriel's "computer" phone line use the game's console-version text
 
 ## Gaps / TODO
 

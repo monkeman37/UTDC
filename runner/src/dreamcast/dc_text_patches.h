@@ -8,4 +8,7 @@
    Returns the number of strings changed. Call after DataWin_parse, before VM_create. */
 int DcTextPatches_apply(DataWin* dw);
 
+/* For ds_map_add: returns the PC text key that should also receive this console key's text. */
+const char* DcTextPatches_aliasFor(const char* key);
+
 #endif

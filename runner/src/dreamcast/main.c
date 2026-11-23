@@ -283,6 +283,11 @@ int main(MAYBE_UNUSED int argc, MAYBE_UNUSED char** argv) {
                     if (!strncmp(line, "title=", 6)) snprintf(title, sizeof title, "%s", line + 6);
                     else if (!strncmp(line, "overlay=", 8)) showOverlay = atoi(line + 8) != 0;
                     else if (!strncmp(line, "exitframe=", 10)) exitFrame = atoi(line + 10);
+                    else if (!strncmp(line, "BS_", 3) && strchr(line, '=')) {
+                        /* test harness: BS_*=value lines become environment variables */
+                        char key[48]; const char* eq = strchr(line, '=');
+                        if (eq - line < (int) sizeof key) { snprintf(key, sizeof key, "%.*s", (int) (eq - line), line); setenv(key, eq + 1, 1); }
+                    }
                     else if (!strncmp(line, "sweep_", 6)) {
                         /* test harness: sweep_mode=, sweep_list=, ... -> BS_SWEEP_* (see sweep.c) */
                         char key[32]; const char* eq = strchr(line, '=');
@@ -320,6 +325,7 @@ int main(MAYBE_UNUSED int argc, MAYBE_UNUSED char** argv) {
     if (!dataWin) fatal("Could not read DATA.WIN from the disc.", "Rebuild the image with the UTDC wizard.");
     bootMark("data.win parsed");
     DcTextPatches_apply(dataWin);
+    { extern const char* (*g_dsMapAddAlias)(const char* key); g_dsMapAddAlias = DcTextPatches_aliasFor; }
     {
         struct mallinfo mi = mallinfo();
         logInfo("DC: data.win loaded, heap in use %d KB\n", mi.uordblks / 1024);

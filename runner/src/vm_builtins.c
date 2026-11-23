@@ -5138,8 +5138,22 @@ static RValue dsMapAddCommon(VMContext* ctx, RValue* args, int32_t argCount, boo
     return RValue_makeUndefined();
 }
 
+// Optional platform hook: maps a text key to another key that should receive the same value
+// (the Dreamcast uses it to show the game's own console-version text for some PC-only lines).
+const char* (*g_dsMapAddAlias)(const char* key) = nullptr;
+
+static RValue dsMapSetCommon(VMContext* ctx, RValue* args, int32_t argCount, bool wrapAsContainer, bool unused);
+
 static RValue builtin_ds_map_add(VMContext* ctx, RValue* args, int32_t argCount) {
-    return dsMapAddCommon(ctx, args, argCount, false, 0);
+    RValue r = dsMapAddCommon(ctx, args, argCount, false, 0);
+    if (g_dsMapAddAlias != nullptr && argCount >= 3 && args[1].type == RVALUE_STRING && args[1].string != nullptr) {
+        const char* target = g_dsMapAddAlias(args[1].string);
+        if (target != nullptr) {
+            RValue a2[3] = { args[0], RValue_makeString(target), args[2] };
+            dsMapSetCommon(ctx, a2, 3, false, false);
+        }
+    }
+    return r;
 }
 
 static RValue builtin_ds_map_add_map(VMContext* ctx, RValue* args, int32_t argCount) {

@@ -28,8 +28,17 @@
 #define MAX_INSTANCES 48
 #define MAX_STREAM_SLOTS 64
 #define MAX_ACTIVE_STREAMS 4       /* KOS supports at most 4 */
-#define STREAM_BUF_PER_CHANNEL SND_STREAM_BUFFER_MAX_ADPCM /* ~32 KB = 1.5 s of 44.1 kHz ADPCM */
-#define SFX_CACHE_BUDGET (1200 * 1024)
+/* Streams are decoded from ADPCM to 16-bit PCM on the SH-4, so the decoder state is always known
+   (exact pause/resume, pitch changes, loops). AICA side: 64 KB per channel = 0.74 s at 44.1 kHz. */
+#define STREAM_BUF_PER_CHANNEL SND_STREAM_BUFFER_MAX
+/* ADPCM read-ahead in main RAM, refilled from disc in the stream thread (~1.1 s of stereo) */
+#define STREAM_PREFETCH (48 * 1024)
+#define STREAM_READ_CHUNK (16 * 1024)
+#define STREAM_DECODE_FRAMES 1024
+#define SFX_CACHE_BUDGET (1100 * 1024)
+/* AICA channels reserved for sound effects (streams take 2 each from the rest) */
+#define SFX_CHANNELS 40
+#define STREAM_CHECKPOINTS 32
 
 typedef struct {
     sfxhnd_t hnd;
@@ -56,9 +65,19 @@ typedef struct {
     /* stream */
     snd_stream_hnd_t stream;
     file_t file;
-    uint32_t pos;            /* bytes consumed */
-    bool finished;
-    uint8_t* buf;
+    uint32_t pos;            /* ADPCM bytes read from disc into buf */
+    bool finished;           /* reached the end (non-looping) */
+    uint64_t drainUntilMs;   /* keep "playing" until the buffered tail has been heard */
+    uint8_t* buf;            /* ADPCM read-ahead */
+    uint32_t bufRd, bufWr;   /* valid bytes are buf[bufRd..bufWr) */
+    uint32_t decPos;         /* ADPCM byte offset of the next byte to decode */
+    int16_t hist[2], step[2];/* ADPCM decoder state per channel */
+    uint32_t decSample;      /* song sample index of the next decoded sample */
+    struct { uint32_t pos, sample; int16_t hist[2], step[2]; } cp[STREAM_CHECKPOINTS];
+    int cpCount, cpHead;
+    uint32_t playStartSample;/* song sample at which the current AICA playback started */
+    uint64_t playStartMs;
+    bool started;            /* AICA stream running */
     DcAudioSystem* owner;
 } DcInstance;
 
@@ -83,6 +102,9 @@ struct DcAudioSystem {
     StreamSlot streams[MAX_STREAM_SLOTS];
     float masterGain;
     bool allPaused;
+    int sfxChan[64];      /* reserved AICA channel numbers */
+    int sfxChanCount;
+    int8_t sfxChanOwner[64]; /* instance index or -1 */
     mutex_t lock;
     kthread_t* thread;
     volatile bool quit;
@@ -196,34 +218,140 @@ static DcInstance* streamOwner(snd_stream_hnd_t hnd) {
     return nullptr;
 }
 
-/* Runs on the stream thread (inside snd_stream_poll) with a->lock held */
+/* AICA 4-bit ADPCM decoder (inverse of the builder's encoder, see builder/src/audio.c) */
+static inline int16_t adpcmStep(uint8_t nib, int16_t* hist, int16_t* step) {
+    static const int stepTable[8] = { 230, 230, 230, 230, 307, 409, 512, 614 };
+    int d = nib & 7;
+    int diff = ((1 + (d << 1)) * *step) >> 3;
+    if (diff > 32767) diff = 32767;
+    int v = (nib & 8) ? *hist - diff : *hist + diff;
+    if (v > 32767) v = 32767;
+    if (v < -32768) v = -32768;
+    int ns = (stepTable[d] * *step) >> 8;
+    if (ns < 127) ns = 127;
+    if (ns > 24576) ns = 24576;
+    *step = (int16_t) ns;
+    *hist = (int16_t) v;
+    return (int16_t) v;
+}
+
+static void streamResetDecoder(DcInstance* in) {
+    in->hist[0] = in->hist[1] = 0;
+    in->step[0] = in->step[1] = 127;
+}
+
+/* bytes of ADPCM per stereo/mono frame pair: mono packs 2 frames per byte, stereo 1 frame per byte */
+static inline uint32_t framesToAdpcmBytes(int channels, uint32_t frames) { return channels == 2 ? frames : frames / 2; }
+
+/* Tops up the ADPCM read-ahead from disc. Called from the stream thread. */
+static void streamPrefetch(DcAudioSystem* a, DcInstance* in) {
+    UtdcAudEntry* e = &a->entries[in->entry];
+    if (in->bufRd > 0 && in->bufRd == in->bufWr) in->bufRd = in->bufWr = 0;
+    if (STREAM_PREFETCH - (in->bufWr - in->bufRd) < STREAM_READ_CHUNK) return;
+    if (in->bufRd > 0) { memmove(in->buf, in->buf + in->bufRd, in->bufWr - in->bufRd); in->bufWr -= in->bufRd; in->bufRd = 0; }
+    while (STREAM_PREFETCH - in->bufWr >= STREAM_READ_CHUNK) {
+        if (in->pos >= e->size) {
+            if (!in->loop) return;
+            in->pos = 0;          /* wrap: the decoder resets when it reaches this point */
+        }
+        uint32_t n = STREAM_READ_CHUNK;
+        if (n > e->size - in->pos) n = e->size - in->pos;
+        fs_seek(in->file, e->offset + in->pos, SEEK_SET);
+        ssize_t got = fs_read(in->file, in->buf + in->bufWr, n);
+        if (got <= 0) return;
+        in->bufWr += (uint32_t) got;
+        in->pos += (uint32_t) got;
+        if (n < STREAM_READ_CHUNK) return; /* reached end of file; continue next time */
+    }
+}
+
+/* Decodes up to `frames` frames into L/R (R unused for mono). Returns frames decoded. */
+static uint32_t streamDecode(DcAudioSystem* a, DcInstance* in, int16_t* L, int16_t* R, uint32_t frames) {
+    UtdcAudEntry* e = &a->entries[in->entry];
+    uint32_t done = 0;
+    while (done < frames) {
+        if (in->decPos >= e->size) {
+            if (!in->loop) { in->finished = true; break; }
+            in->decPos = 0; in->decSample = 0;
+            streamResetDecoder(in);
+        }
+        if (in->bufRd >= in->bufWr) break; /* read-ahead empty (disc slow) */
+        if (e->channels == 2) {
+            uint32_t avail = in->bufWr - in->bufRd, left = e->size - in->decPos;
+            uint32_t n = frames - done;
+            if (n > avail) n = avail;
+            if (n > left) n = left;
+            const uint8_t* src = in->buf + in->bufRd;
+            for (uint32_t i = 0; i < n; i++) {
+                uint8_t b = src[i];
+                L[done + i] = adpcmStep(b >> 4, &in->hist[0], &in->step[0]);
+                R[done + i] = adpcmStep(b & 15, &in->hist[1], &in->step[1]);
+            }
+            in->bufRd += n; in->decPos += n; done += n; in->decSample += n;
+        } else {
+            uint32_t avail = in->bufWr - in->bufRd, left = e->size - in->decPos;
+            uint32_t nb = (frames - done) / 2;
+            if (nb > avail) nb = avail;
+            if (nb > left) nb = left;
+            if (nb == 0) break;
+            const uint8_t* src = in->buf + in->bufRd;
+            for (uint32_t i = 0; i < nb; i++) {
+                uint8_t b = src[i];
+                L[done + 2 * i] = adpcmStep(b & 15, &in->hist[0], &in->step[0]);
+                L[done + 2 * i + 1] = adpcmStep(b >> 4, &in->hist[0], &in->step[0]);
+            }
+            in->bufRd += nb; in->decPos += nb; done += nb * 2; in->decSample += nb * 2;
+        }
+    }
+    return done;
+}
+
+static void streamCheckpoint(DcInstance* in) {
+    int k = in->cpHead;
+    in->cp[k].pos = in->decPos; in->cp[k].sample = in->decSample;
+    in->cp[k].hist[0] = in->hist[0]; in->cp[k].hist[1] = in->hist[1];
+    in->cp[k].step[0] = in->step[0]; in->cp[k].step[1] = in->step[1];
+    in->cpHead = (k + 1) % STREAM_CHECKPOINTS;
+    if (in->cpCount < STREAM_CHECKPOINTS) in->cpCount++;
+}
+
+/* Stream callback (stream thread, inside snd_stream_poll, a->lock held). Decodes into one shared
+   buffer of interleaved 16-bit PCM; KOS splits the channels into sound RAM. */
+static int16_t g_pcm[SND_STREAM_BUFFER_MAX / 2 * 2] __attribute__((aligned(32))); /* 64 KB */
 static void* streamCallback(snd_stream_hnd_t hnd, int req, int* recv) {
+    static int16_t L[STREAM_DECODE_FRAMES], R[STREAM_DECODE_FRAMES];
     DcInstance* in = streamOwner(hnd);
     *recv = 0;
-    if (!in || in->finished || in->paused) return nullptr;
+    if (!in) return nullptr;
     UtdcAudEntry* e = &g_audio->entries[in->entry];
-    int want = req;
-    if (want > STREAM_BUF_PER_CHANNEL * 2) want = STREAM_BUF_PER_CHANNEL * 2;
-    want &= ~31;
-    int have = 0;
-    while (have < want) {
-        uint32_t left = e->size - in->pos;
-        if (left == 0) {
-            if (in->loop) { in->pos = 0; continue; }
-            in->finished = true;
-            break;
+    int ch = e->channels == 2 ? 2 : 1;
+    if (req > (int) sizeof g_pcm) req = (int) sizeof g_pcm;
+    uint32_t framesReq = (uint32_t) req / (uint32_t) ch / 2u;
+    streamCheckpoint(in);
+    uint32_t written = 0;
+    while (written < framesReq) {
+        uint32_t n = framesReq - written;
+        if (n > STREAM_DECODE_FRAMES) n = STREAM_DECODE_FRAMES;
+        uint32_t got = (in->finished || in->paused) ? 0 : streamDecode(g_audio, in, L, R, n);
+        if (got < n) {
+            /* end of a one-shot stream (or the disc fell behind): pad with silence */
+            memset(L + got, 0, (n - got) * 2);
+            memset(R + got, 0, (n - got) * 2);
+            if (in->finished && !in->drainUntilMs) {
+                uint32_t bufFrames = STREAM_BUF_PER_CHANNEL / 2;
+                in->drainUntilMs = timer_ms_gettime64() + (uint64_t) bufFrames * 1000u / (uint64_t) (e->rate * (in->pitch > 0 ? in->pitch : 1.0f)) + 50;
+            }
         }
-        uint32_t n = (uint32_t) (want - have);
-        if (n > left) n = left;
-        fs_seek(in->file, e->offset + in->pos, SEEK_SET);
-        ssize_t got = fs_read(in->file, in->buf + have, n);
-        if (got <= 0) { in->finished = true; break; }
-        have += (int) got;
-        in->pos += (uint32_t) got;
+        if (ch == 2) {
+            int16_t* o = g_pcm + written * 2;
+            for (uint32_t i = 0; i < n; i++) { o[2 * i] = L[i]; o[2 * i + 1] = R[i]; }
+        } else {
+            memcpy(g_pcm + written, L, n * 2);
+        }
+        written += n;
     }
-    if (have < want && have > 0) { memset(in->buf + have, 0, (size_t) (((have + 31) & ~31) - have)); have = (have + 31) & ~31; }
-    *recv = have;
-    return have ? in->buf : nullptr;
+    *recv = (int) (written * 2u * (uint32_t) ch);
+    return g_pcm;
 }
 
 static void* streamThread(void* p) {
@@ -232,23 +360,99 @@ static void* streamThread(void* p) {
         mutex_lock(&a->lock);
         for (int i = 0; i < MAX_INSTANCES; i++) {
             DcInstance* in = &a->inst[i];
-            if (in->active && in->kind == UTDC_AUDKIND_STREAM && in->stream != SND_STREAM_INVALID && !in->paused)
-                snd_stream_poll(in->stream);
+            if (in->active && in->kind == UTDC_AUDKIND_STREAM && in->stream != SND_STREAM_INVALID && in->started) {
+                streamPrefetch(a, in);
+                int pr = snd_stream_poll(in->stream);
+                static uint64_t lastLog;
+                if (getenv("BS_AUDIO_TRACE") && timer_ms_gettime64() - lastLog > 500) {
+                    lastLog = timer_ms_gettime64();
+                    logInfo("DC audio: poll -> %d (decSample %u, decPos %u/%u, rd %u wr %u pos %u)\n", pr, in->decSample, in->decPos, a->entries[in->entry].size, in->bufRd, in->bufWr, in->pos);
+                }
+            }
         }
         mutex_unlock(&a->lock);
-        thd_sleep(15);
+        thd_sleep(10);
     }
     return nullptr;
 }
 
+/* Song sample the listener is hearing now (estimated from the time since the AICA started) */
+static uint32_t streamPlayingSample(DcAudioSystem* a, DcInstance* in) {
+    UtdcAudEntry* e = &a->entries[in->entry];
+    if (!in->started) return in->playStartSample;
+    uint64_t ms = timer_ms_gettime64() - in->playStartMs;
+    uint64_t s = (uint64_t) in->playStartSample + (uint64_t) ((double) ms * (double) e->rate * (double) in->pitch / 1000.0);
+    if (s > in->decSample && in->decSample >= in->playStartSample) s = in->decSample;
+    return (uint32_t) (s % (e->samples ? e->samples : 1));
+}
+
+/* Repositions the decoder at song sample `target`: from the nearest checkpoint at or before it
+   (or the start of the song), then decodes forward. Discards the read-ahead. a->lock held. */
+static void streamSeekSample(DcAudioSystem* a, DcInstance* in, uint32_t target) {
+    UtdcAudEntry* e = &a->entries[in->entry];
+    int best = -1;
+    for (int i = 0; i < in->cpCount; i++)
+        if (in->cp[i].sample <= target && (best < 0 || in->cp[i].sample > in->cp[best].sample)) best = i;
+    if (best >= 0) {
+        in->decPos = in->cp[best].pos; in->decSample = in->cp[best].sample;
+        in->hist[0] = in->cp[best].hist[0]; in->hist[1] = in->cp[best].hist[1];
+        in->step[0] = in->cp[best].step[0]; in->step[1] = in->cp[best].step[1];
+    } else {
+        in->decPos = 0; in->decSample = 0; streamResetDecoder(in);
+    }
+    in->pos = in->decPos; in->bufRd = in->bufWr = 0;
+    in->finished = false; in->drainUntilMs = 0;
+    static int16_t scratchL[STREAM_DECODE_FRAMES], scratchR[STREAM_DECODE_FRAMES];
+    while (in->decSample < target) {
+        streamPrefetch(a, in);
+        uint32_t n = target - in->decSample;
+        if (n > STREAM_DECODE_FRAMES) n = STREAM_DECODE_FRAMES;
+        if (e->channels != 2) n &= ~1u;
+        if (n == 0) break;
+        if (streamDecode(a, in, scratchL, scratchR, n) == 0) break;
+    }
+    in->cpCount = 0; in->cpHead = 0;
+}
+
+/* (Re)starts AICA playback from the decoder's current position. a->lock held. */
+static void streamStartAica(DcAudioSystem* a, DcInstance* in) {
+    UtdcAudEntry* e = &a->entries[in->entry];
+    uint32_t freq = (uint32_t) ((float) e->rate * in->pitch);
+    if (freq < 1000) freq = 1000;
+    if (freq > 88200) freq = 88200;
+    in->playStartSample = in->decSample;
+    streamPrefetch(a, in);
+    snd_stream_start(in->stream, freq, e->channels == 2);
+    in->playStartMs = timer_ms_gettime64();
+    in->started = true;
+    snd_stream_volume(in->stream, volToAica(effectiveGain(a, in)));
+}
+
+/* Stops AICA playback, rewinding the decoder to what the listener last heard. a->lock held. */
+static void streamStopAica(DcAudioSystem* a, DcInstance* in) {
+    if (!in->started) return;
+    uint32_t heard = streamPlayingSample(a, in);
+    snd_stream_stop(in->stream);
+    in->started = false;
+    if (!in->finished) streamSeekSample(a, in, heard);
+}
+
 static void stopInstance(DcAudioSystem* a, DcInstance* in) {
     if (!in->active) return;
+    if (getenv("BS_AUDIO_TRACE")) {
+        UtdcAudEntry* e = &a->entries[in->entry];
+        logInfo("DC audio: sound %d ended after %u ms (length %u ms, %s)\n", (int) in->soundIndex, (unsigned) (nowMs() - in->startMs),
+                (unsigned) ((uint64_t) e->samples * 1000u / e->rate), in->kind == UTDC_AUDKIND_SFX ? "sfx" : "stream");
+    }
     if (in->kind == UTDC_AUDKIND_SFX) {
         if (in->chn >= 0) snd_sfx_stop(in->chn);
+        int idx = (int) (in - a->inst);
+        for (int k = 0; k < a->sfxChanCount; k++) if (a->sfxChanOwner[k] == idx) a->sfxChanOwner[k] = -1;
     } else {
         mutex_lock(&a->lock);
         if (in->stream != SND_STREAM_INVALID) {
-            snd_stream_stop(in->stream);
+            if (in->started) snd_stream_stop(in->stream);
+            in->started = false;
             snd_stream_destroy(in->stream);
             in->stream = SND_STREAM_INVALID;
         }
@@ -295,6 +499,32 @@ static DcInstance* allocInstance(DcAudioSystem* a, int32_t priority) {
     (void) priority;
     if (best) stopInstance(a, best);
     return best;
+}
+
+/* Picks one of our reserved AICA channels for a sound effect. KOS's own picker just rotates
+   through the channels, so a frequent sound (text blips) would cut off a long one that is still
+   playing (e.g. Flowey's laugh during his dialogue). */
+static int pickSfxChannel(DcAudioSystem* a, DcInstance* forInst) {
+    int idx = (int) (forInst - a->inst);
+    int best = -1;
+    for (int k = 0; k < a->sfxChanCount; k++) {
+        int o = a->sfxChanOwner[k];
+        if (o < 0 || !a->inst[o].active || a->inst[o].kind != UTDC_AUDKIND_SFX || a->inst[o].chn != a->sfxChan[k]) { best = k; break; }
+    }
+    if (best < 0) {
+        /* all busy: take the channel of the oldest non-looping effect (or the oldest one) */
+        uint64_t oldest = ~0ull;
+        for (int pass = 0; pass < 2 && best < 0; pass++)
+            for (int k = 0; k < a->sfxChanCount; k++) {
+                DcInstance* o = &a->inst[a->sfxChanOwner[k]];
+                if (pass == 0 && o->loop) continue;
+                if (o->startMs < oldest) { oldest = o->startMs; best = k; }
+            }
+        if (best >= 0) stopInstance(a, &a->inst[a->sfxChanOwner[best]]);
+    }
+    if (best < 0) return -1;
+    a->sfxChanOwner[best] = (int8_t) idx;
+    return a->sfxChan[best];
 }
 
 static int32_t dcaPlaySound(AudioSystem* audio, int32_t soundIndex, int32_t priority, bool loop) {
@@ -347,36 +577,39 @@ static int32_t dcaPlaySound(AudioSystem* audio, int32_t soundIndex, int32_t prio
 
     if (e->kind == UTDC_AUDKIND_SFX) {
         sfxhnd_t h = sfxEnsure(a, entry);
-        if (h == SFXHND_INVALID) return -1;
+        if (h == SFXHND_INVALID) { logWarn("DC audio: could not load sound %d (entry %d, %u bytes)\n", soundIndex, entry, e->size); return -1; }
         sfx_play_data_t pd;
         memset(&pd, 0, sizeof pd);
-        pd.chn = -1;
+        pd.chn = a->sfxChanCount > 0 ? pickSfxChannel(a, in) : -1;
         pd.idx = h;
         pd.vol = volToAica(effectiveGain(a, in));
         pd.pan = 128;
         pd.loop = loop ? 1 : 0;
         pd.freq = (int) (e->rate * pitch);
         in->chn = snd_sfx_play_ex(&pd);
+        if (in->chn < 0) logWarn("DC audio: no AICA channel for sound %d\n", soundIndex);
         in->active = true;
         if (a->allPaused) { in->paused = true; in->pausedAtMs = in->startMs; if (in->chn >= 0) snd_sfx_stop(in->chn); }
     } else {
         in->file = fs_open(a->path, O_RDONLY);
         if (in->file == FILEHND_INVALID) return -1;
-        in->buf = (uint8_t*) memalign(32, STREAM_BUF_PER_CHANNEL * 2);
+        in->buf = (uint8_t*) memalign(32, STREAM_PREFETCH);
+        if (!in->buf) { fs_close(in->file); in->file = FILEHND_INVALID; return -1; }
         mutex_lock(&a->lock);
         in->active = true;
         in->stream = snd_stream_alloc(streamCallback, STREAM_BUF_PER_CHANNEL);
         if (in->stream == SND_STREAM_INVALID) {
             mutex_unlock(&a->lock);
             in->active = false;
-            fs_close(in->file); free(in->buf);
+            fs_close(in->file); free(in->buf); in->buf = nullptr;
             logWarn("DC audio: no free stream for sound %d\n", soundIndex);
             return -1;
         }
-        snd_stream_start_adpcm(in->stream, (uint32_t) (e->rate * pitch), e->channels == 2);
+        streamResetDecoder(in);
+        if (a->allPaused) in->paused = true;
+        else streamStartAica(a, in);
         logInfo("DC audio: stream '%s' started (%u Hz, %s, loop=%d)\n",
                 e->nameOffset < a->hdr.nameBytes ? a->names + e->nameOffset : "?", e->rate, e->channels == 2 ? "stereo" : "mono", loop ? 1 : 0);
-        snd_stream_volume(in->stream, volToAica(effectiveGain(a, in)));
         mutex_unlock(&a->lock);
     }
     return in->id;
@@ -400,7 +633,7 @@ static DcInstance* byId(DcAudioSystem* a, int32_t id) {
 static bool instancePlaying(DcAudioSystem* a, DcInstance* in) {
     if (!in->active) return false;
     if (in->paused) return true;
-    if (in->kind == UTDC_AUDKIND_STREAM) return !in->finished || in->loop;
+    if (in->kind == UTDC_AUDKIND_STREAM) return in->loop || !in->finished || !in->drainUntilMs || nowMs() < in->drainUntilMs;
     if (in->loop) return true;
     UtdcAudEntry* e = &a->entries[in->entry];
     float secs = (float) e->samples / ((float) e->rate * (in->pitch > 0 ? in->pitch : 1.0f));
@@ -456,7 +689,7 @@ static void pauseInstance(DcAudioSystem* a, DcInstance* in) {
     in->paused = true;
     in->pausedAtMs = nowMs();
     if (in->kind == UTDC_AUDKIND_SFX) { if (in->chn >= 0) snd_sfx_stop(in->chn); }
-    else if (in->stream != SND_STREAM_INVALID) { mutex_lock(&a->lock); snd_stream_volume(in->stream, 0); mutex_unlock(&a->lock); }
+    else if (in->stream != SND_STREAM_INVALID) { mutex_lock(&a->lock); streamStopAica(a, in); mutex_unlock(&a->lock); }
 }
 
 static void resumeInstance(DcAudioSystem* a, DcInstance* in) {
@@ -467,13 +700,17 @@ static void resumeInstance(DcAudioSystem* a, DcInstance* in) {
         if (in->loop) {
             sfxhnd_t h = sfxEnsure(a, in->entry);
             sfx_play_data_t pd; memset(&pd, 0, sizeof pd);
-            pd.chn = -1; pd.idx = h; pd.vol = volToAica(effectiveGain(a, in)); pd.pan = 128; pd.loop = 1;
+            pd.chn = a->sfxChanCount > 0 ? pickSfxChannel(a, in) : -1; pd.idx = h; pd.vol = volToAica(effectiveGain(a, in)); pd.pan = 128; pd.loop = 1;
             pd.freq = (int) (a->entries[in->entry].rate * in->pitch);
             in->chn = snd_sfx_play_ex(&pd);
         } else {
             in->active = false;
         }
-    } else applyVolume(a, in);
+    } else if (in->stream != SND_STREAM_INVALID) {
+        mutex_lock(&a->lock);
+        if (!in->started && !in->finished) streamStartAica(a, in);
+        mutex_unlock(&a->lock);
+    }
 }
 
 static void dcaPauseSound(AudioSystem* audio, int32_t target) { DcAudioSystem* a = (DcAudioSystem*) audio; FOR_TARGETS(a, target, pauseInstance(a, in)); }
@@ -502,15 +739,10 @@ static float dcaGetSoundGain(AudioSystem* audio, int32_t target) {
 /* Restarts a music stream at a new playback rate, continuing from the same position.
    (KOS streams can't change frequency while running.) */
 static void restartStreamAtPitch(DcAudioSystem* a, DcInstance* in) {
-    UtdcAudEntry* e = &a->entries[in->entry];
     mutex_lock(&a->lock);
-    if (in->stream != SND_STREAM_INVALID) {
-        snd_stream_stop(in->stream);
-        uint32_t freq = (uint32_t) ((float) e->rate * in->pitch);
-        if (freq < 1000) freq = 1000;
-        if (freq > 88200) freq = 88200;
-        snd_stream_start_adpcm(in->stream, freq, e->channels == 2);
-        snd_stream_volume(in->stream, in->paused ? 0 : volToAica(effectiveGain(a, in)));
+    if (in->stream != SND_STREAM_INVALID && in->started) {
+        streamStopAica(a, in);
+        streamStartAica(a, in);
     }
     mutex_unlock(&a->lock);
 }
@@ -543,7 +775,7 @@ static float dcaGetTrackPosition(AudioSystem* audio, int32_t target) {
     float pos = 0.0f;
     FOR_TARGETS(a, target, {
         UtdcAudEntry* e = &a->entries[in->entry];
-        if (in->kind == UTDC_AUDKIND_STREAM) pos = (float) in->pos * 2.0f / (float) e->channels / (float) e->rate;
+        if (in->kind == UTDC_AUDKIND_STREAM) { mutex_lock(&a->lock); pos = (float) streamPlayingSample(a, in) / (float) e->rate; mutex_unlock(&a->lock); }
         else pos = (float) ((in->paused ? in->pausedAtMs : nowMs()) - in->startMs) / 1000.0f * in->pitch;
         break;
     });
@@ -555,9 +787,17 @@ static void dcaSetTrackPosition(AudioSystem* audio, int32_t target, float second
     FOR_TARGETS(a, target, {
         if (in->kind == UTDC_AUDKIND_STREAM) {
             UtdcAudEntry* e = &a->entries[in->entry];
-            uint32_t bytes = (uint32_t) (seconds * (float) e->rate * (float) e->channels / 2.0f) & ~31u;
-            if (bytes >= e->size) bytes = 0;
-            mutex_lock(&a->lock); in->pos = bytes; in->finished = false; mutex_unlock(&a->lock);
+            uint32_t tgt = (uint32_t) (seconds * (float) e->rate);
+            if (tgt >= e->samples) tgt = 0;
+            if (e->channels != 2) tgt &= ~1u;
+            mutex_lock(&a->lock);
+            bool was = in->started;
+            if (was) { snd_stream_stop(in->stream); in->started = false; }
+            in->cpCount = 0; /* checkpoints may be ahead of the target */
+            streamSeekSample(a, in, tgt);
+            if (was) streamStartAica(a, in);
+            else in->playStartSample = in->decSample;
+            mutex_unlock(&a->lock);
         }
     });
 }
@@ -651,6 +891,21 @@ AudioSystem* DcAudioSystem_create(const char* audioPath) {
     for (uint32_t i = 0; i < a->hdr.entryCount; i++) a->sfx[i].hnd = SFXHND_INVALID;
 
     snd_stream_init_ex(2, STREAM_BUF_PER_CHANNEL);
+    /* Reserve the top AICA channels for sound effects. Streams must keep low channel numbers:
+       KOS starts a stereo stream's two channels with a 32-bit channel mask. */
+    {
+        int got[64], n = 0, c;
+        while (n < 64 && (c = snd_sfx_chn_alloc()) >= 0) got[n++] = c;
+        for (int i = 0; i < n; i++) {
+            if (got[i] >= 64 - SFX_CHANNELS && a->sfxChanCount < SFX_CHANNELS) {
+                a->sfxChan[a->sfxChanCount] = got[i];
+                a->sfxChanOwner[a->sfxChanCount] = -1;
+                a->sfxChanCount++;
+            } else {
+                snd_sfx_chn_free(got[i]);
+            }
+        }
+    }
     mutex_init(&a->lock, MUTEX_TYPE_RECURSIVE);
     g_audio = a;
     a->thread = thd_create(0, streamThread, a);
