@@ -10,7 +10,7 @@
 - Catch-up frames: when the game falls a full frame behind real time, the next frame runs its draw events without rendering (never twice in a row), so frame-timed music cues stay in step with the music (Omega Flowey's phases used to outlast their tracks)
 - Music starts no longer stall the game: the first disc read and AICA prefill happen on the audio thread, and that thread reads the disc with the audio lock released (each start used to cost 20-40 ms on the game thread)
 - Rotated precise collisions compute the rotation once per test instead of once per pixel (double-precision trig is done in software on the SH-4; Omega Flowey's vines cost up to 80 ms per frame)
-- Alphys's lab monitor shows the live camera feed (a 60x40 crop around the player read back from the screen each frame, ~0.2 ms). Emulators that don't keep the rendered picture in emulated VRAM (Flycast's default settings, likely Redream) return a flat colour there; the runner detects that and shows the game's own static picture, the one the Linux/macOS version uses, instead of a blank monitor. Other screen-snapshot effects are skipped on such emulators rather than drawn black. Real hardware (and Flycast with "Emulate framebuffer") gets the live picture
+- Screen captures (`sprite_create_from_surface` on the application surface: the True Lab elevator losing power, Flowey's defeated soul, Alphys's lab monitor, heat shimmer, screen waves, Muffet's border). At boot the runner renders a test colour and reads it back: on real hardware (and Flycast with "Emulate framebuffer") captures read the framebuffer directly. Emulators that keep the picture on the host GPU (Flycast's default, likely Redream) returned stale VRAM there, the boot loading screen; for them the renderer records each frame's polygons and captures with render-to-texture instead: a capture shows from the frame after it is made, and effects that capture every frame use a rolling half-size capture of the previous frame. If a capture still comes back as one flat colour, the lab monitor shows the game's own static picture (the Linux/macOS one)
 - Rendering: sprites (scaled/rotated/coloured), tiles, backgrounds, text with gradients, rectangles,
   lines, primitives, blend modes, views/ports
 - Input (controller → keyboard emulation), naming screen, menus, overworld, battle
@@ -25,6 +25,9 @@
 - Room changes: payloads are read in one request and the last three rooms (plus `room_battle`) stay parsed, so walking back or leaving a battle needs no disc access (was ~300 ms per change)
 - Story `game_end()` calls (the "crash" before the Omega Flowey fight, the end of the Flowey fight, the genocide ending) save and relaunch the game, like restarting it on PC; A+B+X+Y+Start still returns to the BIOS
 - `game_restart()` (e.g. naming the fallen human "Gaster") restarts the game
+- Room changes requested from game code skip drawing the old room once more (as GameMaker does); that frame used to stay on screen for the whole room load
+- True Pacifist credits: the builder copies `credits.txt` (the special-thanks names the PC version reads at run time) from the game folder onto the disc
+- Repeated warnings are logged at most three times each: the serial log blocks while it sends, and a burst of warnings used to stall the game
 - Window movement (`window_set_position`, used by the pre-Omega-Flowey crash and the genocide ending) shakes the picture on screen
 - Date/time events use the Dreamcast's clock (set it in the BIOS); the random seed comes from the clock and boot timing, so the FUN value differs between new games
 - `sprite_create_from_surface(application_surface)` (screen snapshots used by the heat-shimmer, elevator and post-Flowey effects) copies the last displayed frame

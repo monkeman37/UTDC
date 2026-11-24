@@ -23,6 +23,7 @@ Renderer* DcRenderer_create(const char* texturesPath);
 void DcRenderer_beginScene(Renderer* renderer);
 void DcRenderer_endScene(Renderer* renderer);
 void DcRenderer_beginNullScene(Renderer* renderer);
+void DcRenderer_probeFramebuffer(Renderer* renderer);
 void DcRenderer_setWindowOffset(Renderer* renderer, float dx, float dy);
 
 /* Draws a solid rectangle in screen space (debug overlay / loading screen helpers). */

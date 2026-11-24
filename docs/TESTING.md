@@ -67,7 +67,9 @@ builder writes to `UTDC.CFG`:
 | `BS_SWEEP_DEBUG` | `sweep_debug=1` | set `global.debug` (the game's developer keys) |
 | `BS_TEX_PROFILE` (DC) | `BS_TEX_PROFILE=N` | every N frames, log the texture pages the frame used and how much of each it actually drew from (`TEXPROF`) |
 | `BS_NO_CATCHUP` (DC) | `BS_NO_CATCHUP=1` | disable catch-up frames (for comparisons) |
-| `BS_SNAPSHOT_UNREADABLE` (DC) | `BS_SNAPSHOT_UNREADABLE=1` | treat screen snapshots as unreadable (tests the lab-monitor fallback with framebuffer emulation on) |
+| `BS_SNAPSHOT_UNREADABLE` (DC) | `BS_SNAPSHOT_UNREADABLE=1` | treat framebuffer read-back captures as unreadable (tests the lab-monitor fallback) |
+| `BS_FB_READBACK` (DC) | `BS_FB_READBACK=0` or `1` | skip the boot probe: force render-to-texture captures (0) or framebuffer read-back (1) |
+| `BS_FB_THUMB` (DC) | `BS_FB_THUMB=first,last` | log a 16x12 brightness thumbnail of the displayed picture for each frame in the range (`THUMB`); needs Flycast's "Emulate framebuffer" |
 
 While sweeping, CONFIRM/CANCEL/arrows are pressed pseudo-randomly and HP is
 refilled in battles. The Omega Flowey sandbox (room 294, the whole attack cycle with

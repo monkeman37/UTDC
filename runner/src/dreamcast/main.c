@@ -47,8 +47,30 @@ KOS_INIT_FLAGS(INIT_DEFAULT | INIT_MALLOCSTATS);
 
 /* ===[ logging ]=== */
 static bool g_quietLogs = false;
+/* Log output goes over the serial port and blocks while it is sent (~11 KB/s), so a burst of
+   warnings stalls the game (the credits stalled for 224 ms every time a name appeared while
+   credits.txt was missing). Each warning/error message format is printed at most 3 times. */
+static bool logAllowed(const logType type, const char* format) {
+    if (type != LOG_TYPE_WARNING && type != LOG_TYPE_ERROR) return true;
+    static const char* seen[256];
+    static uint8_t count[256];
+    uint32_t h = (uint32_t) (uintptr_t) format;
+    h = (h ^ (h >> 9)) & 255u;
+    for (uint32_t probe = 0; probe < 256; probe++) {
+        uint32_t k = (h + probe) & 255u;
+        if (seen[k] == format) {
+            if (count[k] >= 3) return false;
+            if (++count[k] == 3) dbglog(DBG_INFO, "W: (further messages like the next one are not logged)\n");
+            return true;
+        }
+        if (!seen[k]) { seen[k] = format; count[k] = 1; return true; }
+    }
+    return true;
+}
+
 void platformLog(const logType type, const char* format, va_list va) {
     if (g_quietLogs && type == LOG_TYPE_DEBUG) return;
+    if (!logAllowed(type, format)) return;
     char buf[512];
     vsnprintf(buf, sizeof buf, format, va);
     const char* prefix = type == LOG_TYPE_WARNING ? "W: " : type == LOG_TYPE_ERROR ? "E: " : type == LOG_TYPE_DEBUG ? "D: " : "";
@@ -373,6 +395,7 @@ int main(MAYBE_UNUSED int argc, MAYBE_UNUSED char** argv) {
     bootMark("bytecode packed");
     Runner* runner = Runner_create(dataWin, vm, renderer, fileSystem, audioSystem, bootSeed);
     bootMark("runner create");
+    DcRenderer_probeFramebuffer(renderer);
     {
         struct mallinfo mi = mallinfo();
         logInfo("DC: runner created, heap in use %d KB, free RAM %u KB, VRAM free %d KB\n", mi.uordblks / 1024, freeRamKB(), (int) (pvr_mem_available() / 1024));
@@ -453,20 +476,26 @@ int main(MAYBE_UNUSED int argc, MAYBE_UNUSED char** argv) {
            Omega Flowey's phase changes) keeps real-time pace through a heavy moment. Never two
            in a row, and loading hitches (room changes, >250 ms frames) are forgiven rather than
            fast-forwarded. */
-        bool nullFrame = catchUp && lagUs >= frameUs && !lastWasNull;
-        if (nullFrame) { DcRenderer_beginNullScene(renderer); nullFrames++; }
-        else DcRenderer_beginScene(renderer);
-        lastWasNull = nullFrame;
-        Runner_drawPre(runner, 640, 480);
-        Runner_beginFrame(runner, gameW, gameH, 640, 480, 640, 480);
-        Runner_drawViews(runner, gameW, gameH, false);
-        runner->viewCurrent = 0;
-        renderer->vtable->endFrameInit(renderer);
-        Runner_drawPost(runner, 640, 480);
-        renderer->vtable->endFrameEnd(renderer);
-        Runner_drawGUI(runner, 640, 480, gameW, gameH);
-        if (showOverlay) drawOverlay(renderer, &stats);
-        DcRenderer_endScene(renderer);
+        /* GameMaker switches rooms straight after the step that called room_goto and doesn't
+           draw the old room again. Drawing it here showed a stray frame of the old room (often
+           half set up for the transition) for as long as the room change took. */
+        bool roomChanging = runner->pendingRoom != -1;
+        bool nullFrame = !roomChanging && catchUp && lagUs >= frameUs && !lastWasNull;
+        if (!roomChanging) {
+            if (nullFrame) { DcRenderer_beginNullScene(renderer); nullFrames++; }
+            else DcRenderer_beginScene(renderer);
+            lastWasNull = nullFrame;
+            Runner_drawPre(runner, 640, 480);
+            Runner_beginFrame(runner, gameW, gameH, 640, 480, 640, 480);
+            Runner_drawViews(runner, gameW, gameH, false);
+            runner->viewCurrent = 0;
+            renderer->vtable->endFrameInit(renderer);
+            Runner_drawPost(runner, 640, 480);
+            renderer->vtable->endFrameEnd(renderer);
+            Runner_drawGUI(runner, 640, 480, gameW, gameH);
+            if (showOverlay) drawOverlay(renderer, &stats);
+            DcRenderer_endScene(renderer);
+        }
         uint64_t t2 = timer_us_gettime64();
 
         RunnerKeyboard_beginFrame(runner->keyboard);
@@ -481,6 +510,23 @@ int main(MAYBE_UNUSED int argc, MAYBE_UNUSED char** argv) {
             /* debug: BS_FB_DUMP_FRAME=N prints the displayed framebuffer (RGB565, hex) to the log */
             static int dumpFrame = -2;
             if (dumpFrame == -2) { const char* e = getenv("BS_FB_DUMP_FRAME"); dumpFrame = e ? atoi(e) : -1; }
+            /* debug: BS_FB_THUMB=first,last logs a 16x12 brightness thumbnail of the displayed
+               picture for each frame in that range (transition analysis) */
+            static int thumbA = -2, thumbB = -1;
+            if (thumbA == -2) { const char* e = getenv("BS_FB_THUMB"); thumbA = -1; if (e) sscanf(e, "%d,%d", &thumbA, &thumbB); }
+            if (thumbA >= 0 && runner->frameCount >= thumbA && runner->frameCount <= thumbB) {
+                uint32_t off = PVR_GET(PVR_FB_ADDR) & 0x007FFFFFu;
+                const volatile uint16_t* fb = (const volatile uint16_t*) (PVR_RAM_BASE + off);
+                char line[16 * 12 + 1];
+                for (int ty = 0; ty < 12; ty++)
+                    for (int tx = 0; tx < 16; tx++) {
+                        uint16_t p = fb[(ty * 40 + 20) * 640 + tx * 40 + 20];
+                        int l = (((p >> 11) & 31) * 2 + ((p >> 5) & 63) + (p & 31) * 2) * 15 / 252;
+                        line[ty * 16 + tx] = "0123456789abcdef"[l > 15 ? 15 : l];
+                    }
+                line[16 * 12] = 0;
+                logInfo("THUMB %d %s room %s\n", runner->frameCount, line, runner->currentRoom ? runner->currentRoom->name : "?");
+            }
             if (dumpFrame >= 0 && runner->frameCount == dumpFrame) {
                 uint32_t off = PVR_GET(PVR_FB_ADDR) & 0x007FFFFFu;
                 logInfo("FBINFO addr=%08lx il=%08lx vram_s=%p cfg1=%08lx\n", (unsigned long) PVR_GET(PVR_FB_ADDR), (unsigned long) PVR_GET(PVR_FB_IL_ADDR), (void*) vram_s, (unsigned long) PVR_GET(PVR_FB_CFG_1));

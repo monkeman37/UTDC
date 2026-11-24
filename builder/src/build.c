@@ -83,16 +83,28 @@ int utdc_build(BuildContext* ctx, const BuildOptions* opts) {
     }
 
     {
-        DiscFile files[] = {
+        /* Text files the game reads from its own folder at run time: the PC version loads the
+           special-thanks names of the True Pacifist credits from credits.txt. Copied from the
+           player's Undertale folder when present. */
+        char creditsPath[1100];
+        snprintf(creditsPath, sizeof creditsPath, "%s/credits.txt", opts->gameDir);
+        FILE* cf = fopen(creditsPath, "rb");
+        if (cf) fclose(cf);
+        else build_log(ctx, "warning: credits.txt not found in the game folder; the special-thanks credits will be empty");
+
+        DiscFile all[] = {
             { "1ST_READ.BIN", NULL, utdc_payload_1st_read, utdc_payload_1st_read_size },
             { "DATA.WIN", dwPath, NULL, 0 },
             { "TEXTURES.BIN", texPath, NULL, 0 },
             { "AUDIO.BIN", audPath, NULL, 0 },
             { "UTDC.CFG", cfgPath, NULL, 0 },
+            { "CREDITS.TXT", cf ? creditsPath : NULL, NULL, 0 },
             { "INPUT.JSN", opts->testInputs, NULL, 0 },
         };
-        int fileCount = (int)(sizeof files / sizeof files[0]);
-        if (!opts->testInputs) fileCount--;
+        DiscFile files[sizeof all / sizeof all[0]];
+        int fileCount = 0;
+        for (size_t i = 0; i < sizeof all / sizeof all[0]; i++)
+            if (all[i].srcPath || all[i].mem) files[fileCount++] = all[i];
         if (utdc_payload_1st_read_size < 1024) build_log(ctx, "warning: this builder has no Dreamcast runner embedded (development build)");
         if (disc_write(ctx, opts->format, opts->outPath, utdc_payload_ip_bin, utdc_payload_ip_bin_size,
                        files, fileCount, "UNDERTALE_DC")) goto out;

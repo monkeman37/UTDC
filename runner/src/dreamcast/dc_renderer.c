@@ -109,9 +109,55 @@ typedef struct {
     float scale;             /* sprite pixels per texel (2) */
     uint32_t freeAtFrame;    /* 0 = alive */
     bool used;
+    /* render-to-texture captures (emulators that can't read the framebuffer back, see below) */
+    bool rtt;                /* RGB565 texture written by the PVR */
+    bool pending;            /* not rendered yet (filled at the end of the frame it was made in) */
+    bool live;               /* currently points into the rolling capture */
+    bool ownsVram;           /* vram is this snapshot's own (freed with it) */
+    float offU, offV;        /* texel offset of the rect inside the texture */
+    int16_t rectX, rectY;    /* captured rect, window pixels */
+    uint16_t rectW, rectH;
 } DcSnapshot;
 static DcSnapshot* g_snaps;   /* stb array */
 static int32_t* g_tpagSnap;   /* stb array, index = tpag - origTpagCount */
+
+/* ---------------------------------------------------------------------
+ * Screen captures without framebuffer read-back
+ *
+ * Undertale copies the screen for some effects (the True Lab elevator losing power, Flowey's
+ * defeated soul, Alphys's lab monitor, heat shimmer, screen waves). On a real Dreamcast the
+ * rendered picture is in VRAM and is read back directly. Emulators render on the host GPU and,
+ * with default settings, never write the picture back, so reading VRAM returned stale data (the
+ * boot loading screen). A boot-time probe detects that case; then:
+ *  - every frame's TA stream is recorded (double buffered);
+ *  - a capture made during frame N gets its own texture, rendered with render-to-texture from
+ *    the recording of frame N-1 right after frame N (it shows from frame N+1 on);
+ *  - while captures are being made every frame, a half-size "rolling" capture of each frame is
+ *    rendered too, and new captures point into it at once (no one-frame gap for per-frame
+ *    effects). Captures that outlive their frame are then given their own copy.
+ * ------------------------------------------------------------------- */
+static int g_fbReadable = -1;      /* -1 not probed, 0 no (render-to-texture captures), 1 yes */
+#define REC_CAP (192 * 1024)
+static uint8_t* g_rec[2];          /* recorded 32-byte TA commands of the last two frames */
+static uint8_t* g_recKind[2];      /* per command: 0 vertex, 1 header, 2 header sampling the rolling capture */
+static uint32_t g_recLen[2];       /* commands */
+static int g_recCur;
+static bool g_replaying;
+static pvr_ptr_t g_rollTex;        /* 512x256 RGB565, holds the previous frame at half size */
+static uint32_t g_rollValidFrame;  /* frame whose picture the rolling capture holds */
+static uint32_t g_lastSnapReq;     /* frame of the last capture request */
+#define ROLL_W 512
+#define ROLL_H 256
+
+static void recPrim(const void* data, uint8_t kind) {
+    pvr_prim((void*) data, 32);
+    if (g_fbReadable != 0 || g_replaying || !g_rec[g_recCur]) return;
+    uint32_t n = g_recLen[g_recCur];
+    if ((n + 1) * 32 > REC_CAP) return;
+    memcpy(g_rec[g_recCur] + n * 32, data, 32);
+    g_recKind[g_recCur][n] = kind;
+    g_recLen[g_recCur] = n + 1;
+}
 
 /* ===================================================================== */
 /* Texture cache                                                          */
@@ -171,14 +217,14 @@ static void poolInit(void) {
 static void poolFreeIndex(int32_t i) {
     g_poolFree += g_pool[i].size;
     g_pool[i].page = -1;
-    if (i + 1 < (int32_t) arrlen(g_pool) && g_pool[i + 1].page < 0) { g_pool[i].size += g_pool[i + 1].size; arrdel(g_pool, i + 1); }
-    if (i > 0 && g_pool[i - 1].page < 0) { g_pool[i - 1].size += g_pool[i].size; arrdel(g_pool, i); }
+    if (i + 1 < (int32_t) arrlen(g_pool) && g_pool[i + 1].page == -1) { g_pool[i].size += g_pool[i + 1].size; arrdel(g_pool, i + 1); }
+    if (i > 0 && g_pool[i - 1].page == -1) { g_pool[i - 1].size += g_pool[i].size; arrdel(g_pool, i); }
 }
 
 static void poolFreePtr(pvr_ptr_t p) {
     uint32_t off = (uint32_t) ((uint8_t*) p - g_poolBase);
     for (int32_t i = 0; i < (int32_t) arrlen(g_pool); i++)
-        if (g_pool[i].off == off && g_pool[i].page >= 0) { poolFreeIndex(i); return; }
+        if (g_pool[i].off == off && g_pool[i].page != -1) { poolFreeIndex(i); return; }
 }
 
 /* Small pages are placed best-fit from the bottom of the pool, big ones (256 KB and up, rarely
@@ -190,7 +236,7 @@ static pvr_ptr_t poolTryAlloc(uint32_t bytes, int32_t pageId) {
     bool big = bytes >= POOL_BIG;
     int32_t best = -1;
     for (int32_t i = 0; i < (int32_t) arrlen(g_pool); i++) {
-        if (g_pool[i].page >= 0 || g_pool[i].size < bytes) continue;
+        if (g_pool[i].page != -1 || g_pool[i].size < bytes) continue;
         if (big) best = i;   /* highest fitting block */
         else if (best < 0 || g_pool[i].size < g_pool[best].size) best = i;
     }
@@ -230,6 +276,7 @@ static pvr_ptr_t poolAllocEvicting(DcRenderer* dc, uint32_t bytes, int32_t pageI
             uint32_t got = 0; uint64_t cost = 0;
             for (int32_t j = i; j < n; j++) {
                 PoolBlock* b = &g_pool[j];
+                if (b->page == -2) break;                             /* reserved (rolling capture) */
                 if (b->page >= 0) {
                     uint32_t lu = dc->slots[b->page].lastUsed;
                     if (lu >= keepFrom) break;                       /* pinned: window can't span it */
@@ -444,9 +491,11 @@ static void setState(DcRenderer* dc, int32_t pageId) {
     dc->curPage = pageId; dc->curSrc = src; dc->curDst = dst; dc->curFilter = filter;
 
     pvr_poly_cxt_t cxt;
+    uint8_t recKind = 1;
     if (pageId >= (int32_t) dc->texHdr.pageCount) {
         DcSnapshot* sn = &g_snaps[pageId - (int32_t) dc->texHdr.pageCount];
-        pvr_poly_cxt_txr(&cxt, PVR_LIST_TR_POLY, PVR_TXRFMT_ARGB1555 | PVR_TXRFMT_NONTWIDDLED, sn->texW, sn->texH, sn->vram,
+        if (g_rollTex && sn->vram == g_rollTex) recKind = 2;
+        pvr_poly_cxt_txr(&cxt, PVR_LIST_TR_POLY, (sn->rtt ? PVR_TXRFMT_RGB565 : PVR_TXRFMT_ARGB1555) | PVR_TXRFMT_NONTWIDDLED, sn->texW, sn->texH, sn->vram,
                          filter ? PVR_FILTER_BILINEAR : PVR_FILTER_NONE);
         cxt.txr.env = PVR_TXRENV_MODULATEALPHA;
         cxt.txr.uv_clamp = PVR_UVCLAMP_UV;
@@ -472,7 +521,7 @@ static void setState(DcRenderer* dc, int32_t pageId) {
     cxt.gen.culling = PVR_CULLING_NONE;
     pvr_poly_hdr_t hdr;
     pvr_poly_compile(&hdr, &cxt);
-    pvr_prim(&hdr, sizeof hdr);
+    recPrim(&hdr, recKind);
 }
 
 static inline uint32_t gmColorToArgb(uint32_t bgr, float alpha) {
@@ -508,7 +557,7 @@ static inline void emitVertex(float x, float y, float u, float v, uint32_t argb,
     vert.u = u; vert.v = v;
     vert.argb = argb;
     vert.oargb = 0;
-    pvr_prim(&vert, sizeof vert);
+    recPrim(&vert, 0);
 }
 
 /* Emits a quad given 4 world-space corners in order TL, TR, BR, BL */
@@ -584,10 +633,11 @@ static bool resolveUV(DcRenderer* dc, int32_t tpagIndex, float subX, float subY,
         int32_t k = tpagIndex - (int32_t) dc->origTpagCount;
         if (k >= (int32_t) arrlen(g_tpagSnap) || g_tpagSnap[k] < 0) return false;
         DcSnapshot* sn = &g_snaps[g_tpagSnap[k]];
-        float iw = 1.0f / ((float) sn->texW * sn->scale), ih = 1.0f / ((float) sn->texH * sn->scale);
+        if (sn->pending) return false;   /* rendered after this frame */
+        float iw = 1.0f / (float) sn->texW, ih = 1.0f / (float) sn->texH, is = 1.0f / sn->scale;
         out->page = (int32_t) dc->texHdr.pageCount + g_tpagSnap[k];
-        out->u0 = subX * iw; out->v0 = subY * ih;
-        out->u1 = (subX + subW) * iw; out->v1 = (subY + subH) * ih;
+        out->u0 = (sn->offU + subX * is) * iw; out->v0 = (sn->offV + subY * is) * ih;
+        out->u1 = (sn->offU + (subX + subW) * is) * iw; out->v1 = (sn->offV + (subY + subH) * is) * ih;
         return true;
     }
     if (tpagIndex < 0 || (uint32_t) tpagIndex >= dc->texHdr.itemCount || (uint32_t) tpagIndex >= dw->tpag.count) return false;
@@ -1116,6 +1166,82 @@ static void dcClearScreen(Renderer* renderer, uint32_t color, float alpha) {
 
 static uint32_t nextPow2(uint32_t v) { uint32_t p = 8; while (p < v) p <<= 1; return p; }
 
+/* Wraps snapshot slot snapIdx in a synthetic TPAG + sprite (w x h sprite pixels). */
+static int32_t makeSnapshotSprite(DcRenderer* dc, DataWin* dw, int32_t snapIdx, int32_t w, int32_t h, int32_t xorig, int32_t yorig) {
+    /* synthetic TPAG */
+    uint32_t tpagIndex = 0xFFFFFFFFu;
+    for (uint32_t i = dc->origTpagCount; i < dw->tpag.count; i++) {
+        int32_t k = (int32_t) (i - dc->origTpagCount);
+        if (k < (int32_t) arrlen(g_tpagSnap) && g_tpagSnap[k] < 0) { tpagIndex = i; break; }
+    }
+    if (tpagIndex == 0xFFFFFFFFu) {
+        tpagIndex = dw->tpag.count++;
+        dw->tpag.items = (TexturePageItem*) safeRealloc(dw->tpag.items, dw->tpag.count * sizeof(TexturePageItem));
+        int32_t none = -1;
+        while ((int32_t) arrlen(g_tpagSnap) <= (int32_t) (tpagIndex - dc->origTpagCount)) arrput(g_tpagSnap, none);
+    }
+    TexturePageItem* tp = &dw->tpag.items[tpagIndex];
+    memset(tp, 0, sizeof *tp);
+    tp->sourceWidth = tp->targetWidth = tp->boundingWidth = (uint16_t) w;
+    tp->sourceHeight = tp->targetHeight = tp->boundingHeight = (uint16_t) h;
+    tp->texturePageId = 0;
+    g_tpagSnap[tpagIndex - dc->origTpagCount] = snapIdx;
+
+    uint32_t spriteIndex = DataWin_allocSpriteSlot(dw, dc->origSpriteCount);
+    Sprite* sprite = &dw->sprt.sprites[spriteIndex];
+    sprite->width = (uint32_t) w;
+    sprite->height = (uint32_t) h;
+    sprite->originX = xorig;
+    sprite->originY = yorig;
+    sprite->textureCount = 1;
+    sprite->tpagIndices = (int32_t*) safeMalloc(sizeof(int32_t));
+    sprite->tpagIndices[0] = (int32_t) tpagIndex;
+    sprite->maskCount = 0;
+    sprite->masks = nullptr;
+    return (int32_t) spriteIndex;
+}
+
+static int32_t allocSnapSlot(void) {
+    int32_t snapIdx = -1;
+    for (int32_t k = 0; k < (int32_t) arrlen(g_snaps); k++) if (!g_snaps[k].used) { snapIdx = k; break; }
+    if (snapIdx < 0) { DcSnapshot z = {0}; arrput(g_snaps, z); snapIdx = (int32_t) arrlen(g_snaps) - 1; }
+    DcSnapshot* sn = &g_snaps[snapIdx];
+    memset(sn, 0, sizeof *sn);
+    sn->used = true; sn->scale = 2.0f;
+    return snapIdx;
+}
+
+/* Render-to-texture capture (framebuffer not readable): see the comment at g_fbReadable. */
+static int32_t rttSnapshot(DcRenderer* dc, DataWin* dw, int32_t x, int32_t y, int32_t w, int32_t h, int32_t xorig, int32_t yorig) {
+    g_lastSnapReq = dc->frame;
+    int32_t fx = x + (int32_t) g_winDX, fy = y + (int32_t) g_winDY;
+    int32_t snapIdx;
+    if (g_rollTex && g_rollValidFrame + 1 == dc->frame) {
+        /* the rolling capture holds the previous frame: point into it */
+        snapIdx = allocSnapSlot();
+        DcSnapshot* sn = &g_snaps[snapIdx];
+        sn->rtt = true; sn->live = true; sn->ownsVram = false;
+        sn->vram = g_rollTex; sn->texW = ROLL_W; sn->texH = ROLL_H;
+        sn->offU = (float) fx * 0.5f; sn->offV = (float) fy * 0.5f;
+    } else {
+        uint32_t sw = (uint32_t) (w + 1) / 2, sh = (uint32_t) (h + 1) / 2;
+        if (sw > 512) sw = 512;
+        if (sh > 256) sh = 256;
+        uint32_t texW = nextPow2(sw), texH = nextPow2(sh);
+        uint32_t bytes = texW * texH * 2;
+        pvr_ptr_t mem = nullptr;
+        if (pvr_mem_available() >= bytes + 4096) mem = pvr_mem_malloc(bytes);
+        if (!mem) { logWarn("DC: no VRAM for a %ux%u screen capture\n", texW, texH); return -1; }
+        snapIdx = allocSnapSlot();
+        DcSnapshot* sn = &g_snaps[snapIdx];
+        sn->rtt = true; sn->pending = true; sn->ownsVram = true;
+        sn->vram = mem; sn->texW = (uint16_t) texW; sn->texH = (uint16_t) texH;
+    }
+    DcSnapshot* sn = &g_snaps[snapIdx];
+    sn->rectX = (int16_t) fx; sn->rectY = (int16_t) fy; sn->rectW = (uint16_t) w; sn->rectH = (uint16_t) h;
+    return makeSnapshotSprite(dc, dw, snapIdx, w, h, xorig, yorig);
+}
+
 static int32_t dcCreateSpriteFromSurface(Renderer* renderer, int32_t surfaceID, int32_t x, int32_t y, int32_t w, int32_t h, bool removeback, MAYBE_UNUSED bool smooth, int32_t xorig, int32_t yorig) {
     DcRenderer* dc = (DcRenderer*) renderer;
     DataWin* dw = renderer->dataWin;
@@ -1124,6 +1250,7 @@ static int32_t dcCreateSpriteFromSurface(Renderer* renderer, int32_t surfaceID, 
         if (warned++ < 3) logInfo("DC: sprite_create_from_surface(%d, %d, %d, %d, %d) not supported\n", (int) surfaceID, (int) x, (int) y, (int) w, (int) h);
         return -1;
     }
+    if (g_fbReadable == 0) return rttSnapshot(dc, dw, x, y, w, h, xorig, yorig);
     uint64_t capT0 = timer_us_gettime64();
 
     /* application_surface is the 640x480 window picture, i.e. the framebuffer (minus the
@@ -1187,43 +1314,10 @@ static int32_t dcCreateSpriteFromSurface(Renderer* renderer, int32_t surfaceID, 
     if (forceUnreadable < 0) forceUnreadable = getenv("BS_SNAPSHOT_UNREADABLE") != nullptr;
     if ((uniform || forceUnreadable) && w >= 16 && h >= 16) { pvr_mem_free(mem); return SPRITE_SNAPSHOT_UNREADABLE; }
     /* snapshot slot */
-    int32_t snapIdx = -1;
-    for (int32_t k = 0; k < (int32_t) arrlen(g_snaps); k++) if (!g_snaps[k].used) { snapIdx = k; break; }
-    if (snapIdx < 0) { DcSnapshot z = {0}; arrput(g_snaps, z); snapIdx = (int32_t) arrlen(g_snaps) - 1; }
+    int32_t snapIdx = allocSnapSlot();
     DcSnapshot* sn = &g_snaps[snapIdx];
-    sn->vram = mem; sn->texW = (uint16_t) texW; sn->texH = (uint16_t) texH; sn->scale = 2.0f; sn->freeAtFrame = 0; sn->used = true;
-
-    /* synthetic TPAG */
-    uint32_t tpagIndex = 0xFFFFFFFFu;
-    for (uint32_t i = dc->origTpagCount; i < dw->tpag.count; i++) {
-        int32_t k = (int32_t) (i - dc->origTpagCount);
-        if (k < (int32_t) arrlen(g_tpagSnap) && g_tpagSnap[k] < 0) { tpagIndex = i; break; }
-    }
-    if (tpagIndex == 0xFFFFFFFFu) {
-        tpagIndex = dw->tpag.count++;
-        dw->tpag.items = (TexturePageItem*) safeRealloc(dw->tpag.items, dw->tpag.count * sizeof(TexturePageItem));
-        int32_t none = -1;
-        while ((int32_t) arrlen(g_tpagSnap) <= (int32_t) (tpagIndex - dc->origTpagCount)) arrput(g_tpagSnap, none);
-    }
-    TexturePageItem* tp = &dw->tpag.items[tpagIndex];
-    memset(tp, 0, sizeof *tp);
-    tp->sourceWidth = tp->targetWidth = tp->boundingWidth = (uint16_t) w;
-    tp->sourceHeight = tp->targetHeight = tp->boundingHeight = (uint16_t) h;
-    tp->texturePageId = 0;
-    g_tpagSnap[tpagIndex - dc->origTpagCount] = snapIdx;
-
-    uint32_t spriteIndex = DataWin_allocSpriteSlot(dw, dc->origSpriteCount);
-    Sprite* sprite = &dw->sprt.sprites[spriteIndex];
-    sprite->width = (uint32_t) w;
-    sprite->height = (uint32_t) h;
-    sprite->originX = xorig;
-    sprite->originY = yorig;
-    sprite->textureCount = 1;
-    sprite->tpagIndices = (int32_t*) safeMalloc(sizeof(int32_t));
-    sprite->tpagIndices[0] = (int32_t) tpagIndex;
-    sprite->maskCount = 0;
-    sprite->masks = nullptr;
-    return (int32_t) spriteIndex;
+    sn->vram = mem; sn->texW = (uint16_t) texW; sn->texH = (uint16_t) texH; sn->ownsVram = true;
+    return makeSnapshotSprite(dc, dw, snapIdx, w, h, xorig, yorig);
 }
 
 static void dcDeleteSprite(Renderer* renderer, int32_t spriteIndex) {
@@ -1252,7 +1346,7 @@ static void freeOldSnapshots(DcRenderer* dc) {
     for (int32_t k = 0; k < (int32_t) arrlen(g_snaps); k++) {
         DcSnapshot* sn = &g_snaps[k];
         if (sn->used && sn->freeAtFrame && dc->frame >= sn->freeAtFrame) {
-            pvr_mem_free(sn->vram);
+            if (sn->ownsVram) pvr_mem_free(sn->vram);
             sn->vram = nullptr; sn->used = false; sn->freeAtFrame = 0;
         }
     }
@@ -1461,6 +1555,7 @@ void DcRenderer_beginScene(Renderer* renderer) {
     dc->frame++;
     g_renderSynced = false;
     freeOldSnapshots(dc);
+    if (g_fbReadable == 0) { g_recCur ^= 1; g_recLen[g_recCur] = 0; }
     dc->stats.pageLoadsFrame = 0;
     dc->stats.polysFrame = 0;
     pvr_wait_ready();
@@ -1480,12 +1575,121 @@ void DcRenderer_beginNullScene(Renderer* renderer) {
     dc->stats.polysFrame = 0;
 }
 
+/* Replays a recorded frame into a texture: screen position p becomes (p - origin) * scale.
+   Headers that sample the rolling capture are skipped when rendering into it. */
+static void replayInto(pvr_ptr_t tex, uint32_t texW, uint32_t renderW, uint32_t renderH, int rec, float scale, float ox, float oy, bool skipRoll) {
+    if (renderW < 8 || renderH < 8) return;
+    g_replaying = true;
+    pvr_wait_ready();
+    if (pvr_scene_begin_rtt(tex, renderW, renderH, texW) < 0) { g_replaying = false; return; }
+    pvr_list_begin(PVR_LIST_TR_POLY);
+    bool skipping = false;
+    const uint8_t* cmd = g_rec[rec];
+    for (uint32_t i = 0; i < g_recLen[rec]; i++, cmd += 32) {
+        uint8_t kind = g_recKind[rec][i];
+        if (kind != 0) {
+            skipping = skipRoll && kind == 2;
+            if (!skipping) pvr_prim((void*) cmd, 32);
+            continue;
+        }
+        if (skipping) continue;
+        pvr_vertex_t v;
+        memcpy(&v, cmd, 32);
+        v.x = (v.x - ox) * scale;
+        v.y = (v.y - oy) * scale;
+        pvr_prim(&v, 32);
+    }
+    pvr_list_finish();
+    pvr_scene_finish();
+    g_replaying = false;
+}
+
+/* After the frame's scene: fill captures made during this frame from the previous frame's
+   recording, then refresh the rolling capture while captures are being made. */
+static void captureWork(DcRenderer* dc) {
+    int prev = g_recCur ^ 1, cur = g_recCur;
+    for (int32_t k = 0; k < (int32_t) arrlen(g_snaps); k++) {
+        DcSnapshot* sn = &g_snaps[k];
+        if (!sn->used || !sn->rtt || sn->freeAtFrame) continue;
+        if (sn->live) {
+            /* outlived its frame: give it its own copy before the rolling capture changes */
+            uint32_t sw = (uint32_t) (sn->rectW + 1) / 2, sh = (uint32_t) (sn->rectH + 1) / 2;
+            if (sw > 512) sw = 512;
+            if (sh > 256) sh = 256;
+            uint32_t texW = nextPow2(sw), texH = nextPow2(sh);
+            pvr_ptr_t mem = nullptr;
+            if (pvr_mem_available() >= texW * texH * 2 + 4096) mem = pvr_mem_malloc(texW * texH * 2);
+            if (!mem) continue;   /* keeps showing the rolling capture */
+            sn->vram = mem; sn->texW = (uint16_t) texW; sn->texH = (uint16_t) texH;
+            sn->offU = sn->offV = 0; sn->live = false; sn->ownsVram = true; sn->pending = true;
+        }
+        if (sn->pending) {
+            uint32_t rw = (uint32_t) (sn->rectW + 1) / 2, rh = (uint32_t) (sn->rectH + 1) / 2;
+            if (rw > sn->texW) rw = sn->texW;
+            if (rh > sn->texH) rh = sn->texH;
+            replayInto(sn->vram, sn->texW, rw, rh, prev, 0.5f, (float) sn->rectX, (float) sn->rectY, false);
+            sn->pending = false;
+        }
+    }
+    if (dc->frame - g_lastSnapReq < 60) {
+        if (!g_rollTex) {
+            poolInit();
+            g_rollTex = g_poolBase ? poolAllocEvicting(dc, ROLL_W * ROLL_H * 2, -2) : nullptr;
+        }
+        if (g_rollTex) {
+            replayInto(g_rollTex, ROLL_W, 320, 240, cur, 0.5f, 0.0f, 0.0f, true);
+            g_rollValidFrame = dc->frame;
+        }
+    } else if (g_rollTex) {
+        bool inUse = false;
+        for (int32_t k = 0; k < (int32_t) arrlen(g_snaps); k++) if (g_snaps[k].used && g_snaps[k].vram == g_rollTex) inUse = true;
+        if (!inUse) { poolFreePtr(g_rollTex); g_rollTex = nullptr; g_rollValidFrame = 0; }
+    }
+}
+
+/* Boot probe: render a frame of a known colour and read the displayed framebuffer back. Real
+   hardware (and emulators that emulate the framebuffer) return it; emulators that keep the
+   picture on the host GPU don't, and screen captures then use render-to-texture.
+   BS_FB_READBACK=0/1 overrides the result (testing). */
+void DcRenderer_probeFramebuffer(Renderer* renderer) {
+    DcRenderer* dc = (DcRenderer*) renderer;
+    const char* force = getenv("BS_FB_READBACK");
+    if (force) g_fbReadable = atoi(force) ? 1 : 0;
+    else {
+        pvr_set_bg_color(8.0f / 255.0f, 4.0f / 255.0f, 8.0f / 255.0f);   /* RGB565 0x0821 */
+        for (int i = 0; i < 3; i++) {
+            pvr_wait_ready();
+            pvr_scene_begin();
+            pvr_list_begin(PVR_LIST_TR_POLY);
+            pvr_list_finish();
+            pvr_scene_finish();
+        }
+        pvr_wait_ready();
+        thd_sleep(50);
+        uint32_t off = PVR_GET(PVR_FB_ADDR) & 0x007FFFFFu;
+        const volatile uint16_t* fb = (const volatile uint16_t*) (PVR_RAM_BASE + off);
+        uint16_t a = fb[240 * 640 + 320], b = fb[100 * 640 + 100];
+        g_fbReadable = (a == 0x0821 && b == 0x0821) ? 1 : 0;
+        pvr_set_bg_color(0.0f, 0.0f, 0.0f);
+        logInfo("DC: framebuffer read-back %s (probe read %04x %04x)\n", g_fbReadable ? "works" : "unavailable: screen captures use render-to-texture", (unsigned) a, (unsigned) b);
+    }
+    if (g_fbReadable == 0) {
+        for (int i = 0; i < 2; i++) {
+            g_rec[i] = (uint8_t*) memalign(32, REC_CAP);
+            g_recKind[i] = (uint8_t*) malloc(REC_CAP / 32);
+            if (!g_rec[i] || !g_recKind[i]) { logWarn("DC: no RAM for capture recording\n"); }
+        }
+    }
+    (void) dc;
+}
+
 void DcRenderer_endScene(Renderer* renderer) {
     DcRenderer* dc = (DcRenderer*) renderer;
     if (dc->nullFrame) { dc->nullFrame = false; return; }
     dc->inScene = false;
     pvr_list_finish();
     pvr_scene_finish();
+    if (g_fbReadable == 0 && g_rec[0] && g_rec[1]) captureWork(dc);
     dc->stats.vramFree = g_poolFree;
 }
 

@@ -94,10 +94,13 @@ Writes happen in the background, so saving never stalls the game.
 2. Cuts every sprite out of GameMaker's 2048×2048 texture pages and repacks
    them into small power-of-two, pre-twiddled ARGB1555/ARGB4444 pages
    (LZ4-compressed, sector-aligned) that the PowerVR2 can stream in and out
-   of its ~5 MB of free VRAM → `TEXTURES.BIN`.
+   of its ~5 MB of free VRAM, keeping each sprite's animation frames together.
+   Photographic, many-coloured frames (Omega Flowey) become hardware VQ
+   textures → `TEXTURES.BIN`.
 3. Converts audio to AICA ADPCM at the original 44.1 kHz: sound effects in mono (long ones at the highest rate that fits the AICA 65,534-sample limit, or streamed), music in stereo
    streams → `AUDIO.BIN`.
-4. Writes `data.win` without its texture/audio chunks → `DATA.WIN`.
+4. Writes `data.win` without its texture/audio chunks → `DATA.WIN`, and
+   copies `credits.txt` (the True Pacifist special-thanks names) if present.
 5. Lays out a GD-ROM image (IP.BIN boot sector + ISO 9660 in the
    high-density area) with the Dreamcast runner as `1ST_READ.BIN`.
 
