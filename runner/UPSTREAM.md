@@ -26,6 +26,10 @@ Changes to upstream files (all small and platform-neutral or guarded):
   pin the time with `BS_FAKE_TIME`)
 - `src/runner.h` - `centerWindow` hook
 - `src/sweep.[ch]`, `src/loop.c` - automated room/battle/object coverage sweeps (test harness)
+- `src/collision.h` - precise collision tests compute an instance's rotation once per test (and
+  `Collision_pointInInstance` remembers the last angle's cos/sin); results are bit-identical
+- `src/vm_builtins.c` - `sprite_create_from_screen` / `sprite_create_from_screen_x` (Undertale's
+  lab camera) capture through the renderer's `createSpriteFromSurface` on the application surface
 
 To update: re-vendor a newer Butterscotch and re-apply the above (they are small).
 The Cinnamon runner (Project Sunshine's Nintendo fork) was studied for reference only;

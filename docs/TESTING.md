@@ -62,9 +62,18 @@ builder writes to `UTDC.CFG`:
 | `BS_SWEEP_BOOT` | `sweep_boot=` | frame to start at (use with `tests/smoke.json` so a new game is running) |
 | `BS_SWEEP_FRAMES` | `sweep_frames=` | frames per item |
 | `BS_SWEEP_NOINPUT` | `sweep_noinput=1` | don't mash buttons |
+| `BS_SWEEP_GOD` | `sweep_god=1` | keep HP full and the soul invincible in every mode (including Omega Flowey's own `my_hp`/`my_inv`), so a boss room cycles through all its attacks |
+| `BS_SWEEP_CENSUS` | `sweep_census=N` | every N frames, log the six most numerous objects (`CENSUS f<frame> n=<count>: ...`) to attribute slow frames to attacks |
+| `BS_SWEEP_DEBUG` | `sweep_debug=1` | set `global.debug` (the game's developer keys) |
+| `BS_TEX_PROFILE` (DC) | `BS_TEX_PROFILE=N` | every N frames, log the texture pages the frame used and how much of each it actually drew from (`TEXPROF`) |
+| `BS_NO_CATCHUP` (DC) | `BS_NO_CATCHUP=1` | disable catch-up frames (for comparisons) |
+| `BS_SNAPSHOT_UNREADABLE` (DC) | `BS_SNAPSHOT_UNREADABLE=1` | treat screen snapshots as unreadable (tests the lab-monitor fallback with framebuffer emulation on) |
 
 While sweeping, CONFIRM/CANCEL/arrows are pressed pseudo-randomly and HP is
-refilled in battles. Example (all 113 battle groups on the Dreamcast):
+refilled in battles. The Omega Flowey sandbox (room 294, the whole attack cycle with
+an invincible soul) is `--cfg sweep_mode=rooms --cfg sweep_list=294 --cfg sweep_boot=700
+--cfg sweep_frames=30000 --cfg sweep_god=1 --cfg sweep_census=60`; on the PC build add
+`--seed 7` for a repeatable run. Example (all 113 battle groups on the Dreamcast):
 
 ```sh
 builder/build-linux/utdc-builder-cli Undertale out/UNDERTALE.gdi --test-inputs tests/smoke.json \
@@ -74,6 +83,7 @@ builder/build-linux/utdc-builder-cli Undertale out/UNDERTALE.gdi --test-inputs t
 The Dreamcast log then reports, besides the 5 s stats line:
 `DC: fps dip N`, `DC: slow frame`, `DC: room change took N ms`,
 `DC: room payload X read in N ms`, `DC: out of VRAM for page`, `DC: window shake up to N px`,
+`(catch-up N)` in the stats line (frames whose rendering was skipped to keep real-time pace),
 `Runner: game_end()/game_restart() from <script>`.
 
 `BS_FAKE_TIME="YYYY-MM-DD HH:MM"` pins the clock on PC builds to test date-based

@@ -49,6 +49,8 @@
 //
 // Also used as the initial value of Runner.applicationSurfaceId before the first ensure call.
 #define APPLICATION_SURFACE_ID (-1)
+// createSpriteFromSurface result when the screen can't be read back (see the Dreamcast renderer)
+#define SPRITE_SNAPSHOT_UNREADABLE (-2)
 
 // Sentinel used when beginGUI should render to the host framebuffer.
 #define RENDER_TARGET_HOST_FRAMEBUFFER (-1)

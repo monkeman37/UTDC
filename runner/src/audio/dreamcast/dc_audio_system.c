@@ -78,6 +78,8 @@ typedef struct {
     uint32_t playStartSample;/* song sample at which the current AICA playback started */
     uint64_t playStartMs;
     bool started;            /* AICA stream running */
+    bool startPending;       /* start requested; the stream thread starts it once data is buffered */
+    volatile bool ioBusy;    /* the stream thread is reading this stream's data (lock released) */
     int aicaCh[2];           /* the AICA channels KOS gave this stream (for live pitch changes) */
     DcAudioSystem* owner;
 } DcInstance;
@@ -355,14 +357,36 @@ static void* streamCallback(snd_stream_hnd_t hnd, int req, int* recv) {
     return g_pcm;
 }
 
+static void waitIo(DcAudioSystem* a, DcInstance* in);
+static void streamStartNow(DcAudioSystem* a, DcInstance* in);
+
+/* True if the read-ahead has room for another chunk and there is more to read. */
+static bool streamWantsData(DcAudioSystem* a, DcInstance* in) {
+    UtdcAudEntry* e = &a->entries[in->entry];
+    if (in->pos >= e->size && !in->loop) return false;
+    return STREAM_PREFETCH - (in->bufWr - in->bufRd) >= STREAM_READ_CHUNK;
+}
+
+/* Disc reads happen here with a->lock released (the instance is marked ioBusy, which stop /
+   seek / pause wait for), so the game thread never waits for the GD-ROM when it changes a
+   volume or a pitch. snd_stream_poll (which runs the decode callback) is called with the lock. */
 static void* streamThread(void* p) {
     DcAudioSystem* a = (DcAudioSystem*) p;
     while (!a->quit) {
-        mutex_lock(&a->lock);
         for (int i = 0; i < MAX_INSTANCES; i++) {
+            mutex_lock(&a->lock);
             DcInstance* in = &a->inst[i];
-            if (in->active && in->kind == UTDC_AUDKIND_STREAM && in->stream != SND_STREAM_INVALID && in->started) {
+            bool live = in->active && in->kind == UTDC_AUDKIND_STREAM && in->stream != SND_STREAM_INVALID && in->buf;
+            if (live && (in->started || (in->startPending && !in->paused)) && streamWantsData(a, in)) {
+                in->ioBusy = true;
+                mutex_unlock(&a->lock);
                 streamPrefetch(a, in);
+                mutex_lock(&a->lock);
+                in->ioBusy = false;
+            }
+            live = in->active && in->kind == UTDC_AUDKIND_STREAM && in->stream != SND_STREAM_INVALID && in->buf;
+            if (live && in->startPending && !in->paused && !in->started) streamStartNow(a, in);
+            if (live && in->started) {
                 int pr = snd_stream_poll(in->stream);
                 static uint64_t lastLog;
                 if (getenv("BS_AUDIO_TRACE") && timer_ms_gettime64() - lastLog > 500) {
@@ -370,8 +394,8 @@ static void* streamThread(void* p) {
                     logInfo("DC audio: poll -> %d (decSample %u, decPos %u/%u, rd %u wr %u pos %u)\n", pr, in->decSample, in->decPos, a->entries[in->entry].size, in->bufRd, in->bufWr, in->pos);
                 }
             }
+            mutex_unlock(&a->lock);
         }
-        mutex_unlock(&a->lock);
         thd_sleep(10);
     }
     return nullptr;
@@ -391,6 +415,7 @@ static uint32_t streamPlayingSample(DcAudioSystem* a, DcInstance* in) {
    (or the start of the song), then decodes forward. Discards the read-ahead. a->lock held. */
 static void streamSeekSample(DcAudioSystem* a, DcInstance* in, uint32_t target) {
     UtdcAudEntry* e = &a->entries[in->entry];
+    waitIo(a, in);
     int best = -1;
     for (int i = 0; i < in->cpCount; i++)
         if (in->cp[i].sample <= target && (best < 0 || in->cp[i].sample > in->cp[best].sample)) best = i;
@@ -415,23 +440,41 @@ static void streamSeekSample(DcAudioSystem* a, DcInstance* in, uint32_t target) 
     in->cpCount = 0; in->cpHead = 0;
 }
 
-/* (Re)starts AICA playback from the decoder's current position. a->lock held. */
+/* Waits until the stream thread has finished reading this stream's data. a->lock held (it is
+   released while waiting so the thread can finish). Only operations that touch the read-ahead
+   need this (stop, seek, pause), and only right after a start does it ever wait. */
+static void waitIo(DcAudioSystem* a, DcInstance* in) {
+    while (in->ioBusy) { mutex_unlock(&a->lock); thd_pass(); mutex_lock(&a->lock); }
+}
+
+/* Requests AICA playback from the decoder's current position. a->lock held.
+   The disc read and the AICA start happen on the stream thread: a start used to read 48 KB from
+   the disc and prefill the AICA buffers on the game thread, a 20-40 ms hitch at every music
+   change (far more on a real GD-ROM). */
 static void streamStartAica(DcAudioSystem* a, DcInstance* in) {
+    (void) a;
+    in->playStartSample = in->decSample;
+    in->startPending = true;
+}
+
+/* Stream thread, a->lock held, data buffered: starts the AICA side. */
+static void streamStartNow(DcAudioSystem* a, DcInstance* in) {
     UtdcAudEntry* e = &a->entries[in->entry];
     uint32_t freq = (uint32_t) ((float) e->rate * in->pitch);
     if (freq < 1000) freq = 1000;
     if (freq > 88200) freq = 88200;
     in->playStartSample = in->decSample;
-    streamPrefetch(a, in);
     snd_stream_start(in->stream, freq, e->channels == 2);
     in->playStartMs = timer_ms_gettime64();
     in->started = true;
+    in->startPending = false;
     snd_stream_volume(in->stream, volToAica(effectiveGain(a, in)));
 }
 
 /* Stops AICA playback, rewinding the decoder to what the listener last heard. a->lock held. */
 static void streamStopAica(DcAudioSystem* a, DcInstance* in) {
-    if (!in->started) return;
+    waitIo(a, in);
+    if (!in->started) { in->startPending = false; return; }
     uint32_t heard = streamPlayingSample(a, in);
     snd_stream_stop(in->stream);
     in->started = false;
@@ -451,6 +494,8 @@ static void stopInstance(DcAudioSystem* a, DcInstance* in) {
         for (int k = 0; k < a->sfxChanCount; k++) if (a->sfxChanOwner[k] == idx) a->sfxChanOwner[k] = -1;
     } else {
         mutex_lock(&a->lock);
+        waitIo(a, in);
+        in->startPending = false;
         if (in->stream != SND_STREAM_INVALID) {
             if (in->started) snd_stream_stop(in->stream);
             in->started = false;
@@ -715,7 +760,7 @@ static void resumeInstance(DcAudioSystem* a, DcInstance* in) {
         }
     } else if (in->stream != SND_STREAM_INVALID) {
         mutex_lock(&a->lock);
-        if (!in->started && !in->finished) streamStartAica(a, in);
+        if (!in->started && !in->startPending && !in->finished) streamStartAica(a, in);
         mutex_unlock(&a->lock);
     }
 }
@@ -816,8 +861,10 @@ static void dcaSetTrackPosition(AudioSystem* audio, int32_t target, float second
             if (tgt >= e->samples) tgt = 0;
             if (e->channels != 2) tgt &= ~1u;
             mutex_lock(&a->lock);
-            bool was = in->started;
-            if (was) { snd_stream_stop(in->stream); in->started = false; }
+            waitIo(a, in);
+            bool was = in->started || in->startPending;
+            if (in->started) { snd_stream_stop(in->stream); in->started = false; }
+            in->startPending = false;
             in->cpCount = 0; /* checkpoints may be ahead of the target */
             streamSeekSample(a, in, tgt);
             if (was) streamStartAica(a, in);

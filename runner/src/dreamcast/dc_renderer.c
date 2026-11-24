@@ -76,6 +76,7 @@ typedef struct {
     bool blendEnabled;
     int32_t blendSrc, blendDst;   /* GM bm_* factors */
     bool inScene;
+    bool nullFrame;     /* catch-up frame: draw events run, nothing is rendered or uploaded */
     bool drawingToSurface;
 
     /* primitive batching */
@@ -138,30 +139,132 @@ static bool openTextures(DcRenderer* dc, const char* path) {
 
 static bool g_renderSynced; /* waited for the previous frame's render during this frame */
 
-static bool evictOne(DcRenderer* dc) {
-    int32_t victim = -1;
-    uint32_t oldest = 0xFFFFFFFFu;
-    for (int pass = 0; pass < 2 && victim < 0; pass++) {
-        /* Pages used by this frame are never evicted. Pages used by the previous frame may
-           still be read by the PVR; only after waiting for that render to finish (pass 2,
-           needed on busy room/battle transitions) can they be reused. */
-        if (pass == 1) {
-            if (!g_renderSynced) { pvr_wait_render_done(); g_renderSynced = true; }
-        }
-        uint32_t keepFrom = pass == 0 ? dc->frame - 1 : dc->frame;
-        for (uint32_t i = 0; i < dc->texHdr.pageCount; i++) {
-            DcPageSlot* s = &dc->slots[i];
-            if (!s->vram) continue;
-            if (s->lastUsed >= keepFrom) continue;
-            if (s->lastUsed < oldest) { oldest = s->lastUsed; victim = (int32_t) i; }
+/* ---------------------------------------------------------------------
+ * Texture VRAM pool
+ *
+ * Texture pages live in one big VRAM region managed here instead of in the KOS VRAM heap.
+ * Pages range from 6 KB (small VQ pages) to 2 MB, and with the KOS heap a big page could fail to
+ * fit even with plenty of VRAM free in total (fragmentation): every failed pvr_mem_malloc printed
+ * an error over the serial port and only one page was evicted per retry, which stalled a frame
+ * for over half a second in Omega Flowey's fight. Here a failed allocation picks the cheapest run
+ * of neighbouring pages that frees a big enough contiguous hole and evicts exactly those, once.
+ * ------------------------------------------------------------------- */
+typedef struct { uint32_t off, size; int32_t page; } PoolBlock;   /* page -1: free */
+static PoolBlock* g_pool;          /* stb array, sorted by offset, covers the whole region */
+static uint8_t* g_poolBase;
+static uint32_t g_poolSize, g_poolFree;
+#define POOL_RESERVE (384 * 1024)  /* left in the KOS heap for screen snapshots and small buffers */
+
+static void poolInit(void) {
+    if (g_poolBase) return;
+    size_t avail = pvr_mem_available();
+    if (avail <= POOL_RESERVE + 65536) return;
+    uint32_t size = (uint32_t) ((avail - POOL_RESERVE) & ~4095u);
+    g_poolBase = (uint8_t*) pvr_mem_malloc(size);
+    if (!g_poolBase) return;
+    g_poolSize = g_poolFree = size;
+    PoolBlock all = { 0, size, -1 };
+    arrput(g_pool, all);
+    logInfo("DC: texture pool %u KB\n", (unsigned) (size / 1024));
+}
+
+static void poolFreeIndex(int32_t i) {
+    g_poolFree += g_pool[i].size;
+    g_pool[i].page = -1;
+    if (i + 1 < (int32_t) arrlen(g_pool) && g_pool[i + 1].page < 0) { g_pool[i].size += g_pool[i + 1].size; arrdel(g_pool, i + 1); }
+    if (i > 0 && g_pool[i - 1].page < 0) { g_pool[i - 1].size += g_pool[i].size; arrdel(g_pool, i); }
+}
+
+static void poolFreePtr(pvr_ptr_t p) {
+    uint32_t off = (uint32_t) ((uint8_t*) p - g_poolBase);
+    for (int32_t i = 0; i < (int32_t) arrlen(g_pool); i++)
+        if (g_pool[i].off == off && g_pool[i].page >= 0) { poolFreeIndex(i); return; }
+}
+
+/* Small pages are placed best-fit from the bottom of the pool, big ones (256 KB and up, rarely
+   used backgrounds and 1024-wide pages) at the top end, so the small pages a frame is drawing
+   don't end up scattered through the space a big page needs. */
+#define POOL_BIG (256 * 1024)
+static pvr_ptr_t poolTryAlloc(uint32_t bytes, int32_t pageId) {
+    bytes = (bytes + 31) & ~31u;
+    bool big = bytes >= POOL_BIG;
+    int32_t best = -1;
+    for (int32_t i = 0; i < (int32_t) arrlen(g_pool); i++) {
+        if (g_pool[i].page >= 0 || g_pool[i].size < bytes) continue;
+        if (big) best = i;   /* highest fitting block */
+        else if (best < 0 || g_pool[i].size < g_pool[best].size) best = i;
+    }
+    if (best < 0) return nullptr;
+    int32_t at = best;
+    if (g_pool[best].size > bytes) {
+        if (big) {
+            /* carve from the top end of the block */
+            PoolBlock top = { g_pool[best].off + g_pool[best].size - bytes, bytes, -1 };
+            g_pool[best].size -= bytes;
+            arrins(g_pool, best + 1, top);
+            at = best + 1;
+        } else {
+            PoolBlock rest = { g_pool[best].off + bytes, g_pool[best].size - bytes, -1 };
+            arrins(g_pool, best + 1, rest);
+            g_pool[best].size = bytes;
         }
     }
-    if (victim < 0) return false;
-    pvr_mem_free(dc->slots[victim].vram);
-    dc->slots[victim].vram = nullptr;
-    dc->stats.pagesLoaded--;
-    dc->stats.evictions++;
-    return true;
+    g_pool[at].page = pageId;
+    g_poolFree -= bytes;
+    return (pvr_ptr_t) (g_poolBase + g_pool[at].off);
+}
+
+/* Allocates VRAM for a page, evicting the cheapest run of neighbouring pages if needed.
+   keepFrom: pages used at or after this frame are pinned (still drawn / still being read). */
+static pvr_ptr_t poolAllocEvicting(DcRenderer* dc, uint32_t bytes, int32_t pageId) {
+    pvr_ptr_t p = poolTryAlloc(bytes, pageId);
+    if (p) return p;
+    uint32_t need = (bytes + 31) & ~31u;
+    for (int pass = 0; pass < 2; pass++) {
+        if (pass == 1 && !g_renderSynced) { pvr_wait_render_done(); g_renderSynced = true; }
+        uint32_t keepFrom = pass == 0 ? dc->frame - 1 : dc->frame;
+        int32_t n = (int32_t) arrlen(g_pool);
+        int32_t bestI = -1, bestJ = -1;
+        uint64_t bestCost = ~0ull;
+        for (int32_t i = 0; i < n; i++) {
+            uint32_t got = 0; uint64_t cost = 0;
+            for (int32_t j = i; j < n; j++) {
+                PoolBlock* b = &g_pool[j];
+                if (b->page >= 0) {
+                    uint32_t lu = dc->slots[b->page].lastUsed;
+                    if (lu >= keepFrom) break;                       /* pinned: window can't span it */
+                    /* cost: bytes thrown away, weighted up for recently used pages */
+                    uint32_t age = dc->frame - lu;
+                    cost += (uint64_t) b->size * (age < 30 ? 8 : age < 300 ? 2 : 1);
+                }
+                got += b->size;
+                if (got >= need) {
+                    bool bigAlloc = need >= POOL_BIG;
+                    if (cost < bestCost || (bigAlloc && cost == bestCost)) { bestCost = cost; bestI = i; bestJ = j; }
+                    break;
+                }
+            }
+        }
+        if (bestI >= 0) {
+            /* evict the pages in [bestI, bestJ]; indices shift as blocks merge, so go by offset */
+            uint32_t from = g_pool[bestI].off, to = g_pool[bestJ].off;
+            for (int32_t k = 0; k < (int32_t) arrlen(g_pool); k++) {
+                if (g_pool[k].off < from) continue;
+                if (g_pool[k].off > to) break;
+                if (g_pool[k].page >= 0) {
+                    int32_t victim = g_pool[k].page;
+                    dc->slots[victim].vram = nullptr;
+                    dc->stats.pagesLoaded--;
+                    dc->stats.evictions++;
+                    poolFreeIndex(k);
+                    k = -1;   /* restart: the array changed */
+                }
+            }
+            p = poolTryAlloc(bytes, pageId);
+            if (p) return p;
+        }
+    }
+    return nullptr;
 }
 
 /* Minimal LZ4 block decoder (format: https://github.com/lz4/lz4/blob/dev/doc/lz4_Block_format.md).
@@ -235,7 +338,7 @@ static bool uploadPage(DcRenderer* dc, uint32_t pageId, pvr_ptr_t dst) {
             return false;
         }
     }
-    uint32_t outTotal = (uint32_t) pg->width * pg->height * 2;
+    uint32_t outTotal = UTDC_TEX_PAGE_BYTES(pg->width, pg->height, pg->format);
     uint32_t outPos = 0, inPos = 0;
     bool ok = true;
     while (inPos < pg->compSize && outPos < outTotal) {
@@ -273,18 +376,15 @@ static bool ensurePage(DcRenderer* dc, uint32_t pageId) {
     if (s->vram) return true;
     if (s->retryFrame > dc->frame) return false;
     UtdcTexPage* pg = &dc->pages[pageId];
-    uint32_t bytes = (uint32_t) pg->width * pg->height * 2;
-    pvr_ptr_t mem = nullptr;
-    for (;;) {
-        if (pvr_mem_available() >= bytes + 4096) mem = pvr_mem_malloc(bytes);
-        if (mem) break;
-        if (!evictOne(dc)) {
-            uint32_t inUse = 0, inUseBytes = 0;
-            for (uint32_t i = 0; i < dc->texHdr.pageCount; i++) if (dc->slots[i].vram && dc->slots[i].lastUsed == dc->frame) { inUse++; inUseBytes += dc->slots[i].bytes; }
-            s->retryFrame = dc->frame + 1;
-            logWarn("DC: out of VRAM for page %u (%u bytes): %u pages (%u KB) in use this frame, %u KB free\n", pageId, bytes, inUse, inUseBytes / 1024, (unsigned) (pvr_mem_available() / 1024));
-            return false;
-        }
+    uint32_t bytes = UTDC_TEX_PAGE_BYTES(pg->width, pg->height, pg->format);
+    poolInit();
+    pvr_ptr_t mem = g_poolBase ? poolAllocEvicting(dc, bytes, (int32_t) pageId) : nullptr;
+    if (!mem) {
+        uint32_t inUse = 0, inUseBytes = 0;
+        for (uint32_t i = 0; i < dc->texHdr.pageCount; i++) if (dc->slots[i].vram && dc->slots[i].lastUsed == dc->frame) { inUse++; inUseBytes += dc->slots[i].bytes; }
+        s->retryFrame = dc->frame + 1;
+        logWarn("DC: out of VRAM for page %u (%u bytes): %u pages (%u KB) in use this frame, %u KB free in the pool\n", pageId, bytes, inUse, inUseBytes / 1024, (unsigned) (g_poolFree / 1024));
+        return false;
     }
     uint64_t t0 = timer_us_gettime64();
     bool ok = uploadPage(dc, pageId, mem);
@@ -296,7 +396,7 @@ static bool ensurePage(DcRenderer* dc, uint32_t pageId) {
 #endif
     if (!ok) {
         logError("DC: failed to load texture page %u\n", pageId);
-        pvr_mem_free(mem);
+        poolFreePtr(mem);
         s->retryFrame = dc->frame + 30;
         return false;
     }
@@ -352,7 +452,9 @@ static void setState(DcRenderer* dc, int32_t pageId) {
         cxt.txr.uv_clamp = PVR_UVCLAMP_UV;
     } else if (pageId >= 0) {
         UtdcTexPage* pg = &dc->pages[pageId];
-        int fmt = pg->format == UTDC_TEXFMT_ARGB4444 ? PVR_TXRFMT_ARGB4444 : (pg->format == UTDC_TEXFMT_RGB565 ? PVR_TXRFMT_RGB565 : PVR_TXRFMT_ARGB1555);
+        int base = pg->format & ~UTDC_TEXFMT_VQ;
+        int fmt = base == UTDC_TEXFMT_ARGB4444 ? PVR_TXRFMT_ARGB4444 : (base == UTDC_TEXFMT_RGB565 ? PVR_TXRFMT_RGB565 : PVR_TXRFMT_ARGB1555);
+        if (pg->format & UTDC_TEXFMT_VQ) fmt |= PVR_TXRFMT_VQ_ENABLE;   /* codebook + twiddled indices */
         pvr_poly_cxt_txr(&cxt, PVR_LIST_TR_POLY, fmt | PVR_TXRFMT_TWIDDLED, pg->width, pg->height, dc->slots[pageId].vram,
                          filter ? PVR_FILTER_BILINEAR : PVR_FILTER_NONE);
         cxt.txr.env = PVR_TXRENV_MODULATEALPHA;
@@ -444,6 +546,38 @@ static void emitTriangle(DcRenderer* dc, int32_t pageId, const float* wx, const 
  * texture-page pixel space relative to the TPAG's source rect. */
 typedef struct { int32_t page; float u0, v0, u1, v1; } DcUV;
 
+/* Texture working-set profiler (BS_TEX_PROFILE=N: every N frames log how much of each page the
+   frame actually used). Used to size page/packing decisions for heavy scenes. */
+static int g_texProfEvery = -1;
+static uint32_t* g_itemStamp;   /* frame an item was last counted */
+static uint32_t* g_pageArea;    /* texels of distinct items used this frame */
+static uint32_t* g_pageStamp;
+static void texProfNote(DcRenderer* dc, uint32_t tpag, const UtdcTexItem* it) {
+    if (!g_itemStamp) {
+        g_itemStamp = (uint32_t*) safeCalloc(dc->texHdr.itemCount, sizeof(uint32_t));
+        g_pageArea = (uint32_t*) safeCalloc(dc->texHdr.pageCount, sizeof(uint32_t));
+        g_pageStamp = (uint32_t*) safeCalloc(dc->texHdr.pageCount, sizeof(uint32_t));
+    }
+    if (g_itemStamp[tpag] == dc->frame) return;
+    g_itemStamp[tpag] = dc->frame;
+    if (g_pageStamp[it->page] != dc->frame) { g_pageStamp[it->page] = dc->frame; g_pageArea[it->page] = 0; }
+    g_pageArea[it->page] += (uint32_t) (it->w + 2) * (uint32_t) (it->h + 2);
+}
+static void texProfReport(DcRenderer* dc) {
+    if (!g_texProfEvery || !g_pageStamp || dc->frame % (uint32_t) g_texProfEvery) return;
+    uint32_t pages = 0, pageTexels = 0, usedTexels = 0, vramBytes = 0;
+    char buf[480]; int len = 0;
+    for (uint32_t i = 0; i < dc->texHdr.pageCount; i++) {
+        if (g_pageStamp[i] != dc->frame) continue;
+        uint32_t pt = (uint32_t) dc->pages[i].width * dc->pages[i].height;
+        pages++; pageTexels += pt; usedTexels += g_pageArea[i];
+        vramBytes += UTDC_TEX_PAGE_BYTES(dc->pages[i].width, dc->pages[i].height, dc->pages[i].format);
+        if (len < 400) len += snprintf(buf + len, sizeof buf - (size_t) len, " %u:%u%%", (unsigned) i, (unsigned) (g_pageArea[i] * 100u / pt));
+    }
+    logInfo("TEXPROF f%u pages %u (%u KB VRAM) used %u Ktexels (%u%%):%s\n", (unsigned) dc->frame, pages, vramBytes / 1024, usedTexels / 1024,
+            pageTexels ? (unsigned) (usedTexels * 100u / pageTexels) : 0u, buf);
+}
+
 static bool resolveUV(DcRenderer* dc, int32_t tpagIndex, float subX, float subY, float subW, float subH, DcUV* out) {
     DataWin* dw = dc->base.dataWin;
     if (tpagIndex >= (int32_t) dc->origTpagCount && (uint32_t) tpagIndex < dw->tpag.count) {
@@ -457,8 +591,10 @@ static bool resolveUV(DcRenderer* dc, int32_t tpagIndex, float subX, float subY,
         return true;
     }
     if (tpagIndex < 0 || (uint32_t) tpagIndex >= dc->texHdr.itemCount || (uint32_t) tpagIndex >= dw->tpag.count) return false;
+    if (dc->nullFrame) return false;
     UtdcTexItem* it = &dc->items[tpagIndex];
     if (it->page == UTDC_TEX_NO_PAGE) return false;
+    if (g_texProfEvery) texProfNote(dc, (uint32_t) tpagIndex, it);
     if (!ensurePage(dc, it->page)) return false;
     TexturePageItem* tp = &dw->tpag.items[tpagIndex];
     float kx = tp->sourceWidth ? (float) it->w / (float) tp->sourceWidth : 1.0f;
@@ -502,7 +638,7 @@ static void dcInit(Renderer* renderer, DataWin* dataWin) {
 
 static void dcDestroy(Renderer* renderer) {
     DcRenderer* dc = (DcRenderer*) renderer;
-    for (uint32_t i = 0; i < dc->texHdr.pageCount; i++) if (dc->slots[i].vram) pvr_mem_free(dc->slots[i].vram);
+    if (g_poolBase) { pvr_mem_free(g_poolBase); g_poolBase = nullptr; arrfree(g_pool); }
     if (dc->texFile != FILEHND_INVALID) fs_close(dc->texFile);
     free(dc->pages); free(dc->items); free(dc->slots); free(dc->dict);
     free(dc->surfaceW); free(dc->surfaceH); free(dc->surfaceAlive);
@@ -999,11 +1135,8 @@ static int32_t dcCreateSpriteFromSurface(Renderer* renderer, int32_t surfaceID, 
     uint32_t texW = nextPow2(sw), texH = nextPow2(sh);
     uint32_t bytes = texW * texH * 2;
     pvr_ptr_t mem = nullptr;
-    for (;;) {
-        if (pvr_mem_available() >= bytes + 4096) mem = pvr_mem_malloc(bytes);
-        if (mem) break;
-        if (!evictOne(dc)) { logWarn("DC: no VRAM for a %ux%u screen snapshot\n", texW, texH); return -1; }
-    }
+    if (pvr_mem_available() >= bytes + 4096) mem = pvr_mem_malloc(bytes);
+    if (!mem) { logWarn("DC: no VRAM for a %ux%u screen snapshot\n", texW, texH); return -1; }
     uint32_t fbOff = PVR_GET(PVR_FB_ADDR) & 0x007FFFFFu;
     /* Read the framebuffer through the cache (P1 mirror of the 32-bit VRAM area) so each 32-byte
        line comes in one burst; invalidate first so no stale lines are used. */
@@ -1011,6 +1144,7 @@ static int32_t dcCreateSpriteFromSurface(Renderer* renderer, int32_t surfaceID, 
     static uint16_t rowBuf[512] __attribute__((aligned(32)));
     uint16_t key = 0;
     bool haveKey = false;
+    uint16_t firstTexel = 0; bool uniform = true; bool firstSeen = false;
     uint32_t rowBytes = (sw * 2 + 31) & ~31u;
     if (rowBytes > texW * 2) rowBytes = texW * 2;
     for (uint32_t j = 0; j < sh; j++) {
@@ -1025,6 +1159,7 @@ static int32_t dcCreateSpriteFromSurface(Renderer* renderer, int32_t surfaceID, 
                 int32_t sx = fx + i * 2;
                 if (sx >= 640) break;
                 uint16_t p565 = src[sx];
+                if (!firstSeen) { firstTexel = p565; firstSeen = true; } else if (p565 != firstTexel) uniform = false;
                 uint16_t c = (uint16_t) (0x8000 | ((p565 >> 1) & 0x7FE0) | (p565 & 0x1F)); /* RGB565 -> ARGB1555 */
                 if (removeback) {
                     if (!haveKey) { key = c; haveKey = true; }
@@ -1041,8 +1176,16 @@ static int32_t dcCreateSpriteFromSurface(Renderer* renderer, int32_t surfaceID, 
     {
         static uint32_t capCount;
         if ((capCount++ % 60) == 0)
-            logInfo("DC: screen snapshot %dx%d at (%d,%d) took %u us\n", (int) w, (int) h, (int) x, (int) y, (unsigned) (timer_us_gettime64() - capT0));
+            logInfo("DC: screen snapshot %dx%d at (%d,%d) took %u us%s\n", (int) w, (int) h, (int) x, (int) y, (unsigned) (timer_us_gettime64() - capT0),
+                    uniform ? " (flat colour: framebuffer not readable here?)" : "");
     }
+    /* A capture of a real scene is never one flat colour. When it is, the framebuffer can't be
+       read back (emulators that render on the host GPU only copy it to emulated VRAM when asked
+       to); report that so the caller can fall back instead of showing a black box. Real hardware
+       always reads the real picture. */
+    static int forceUnreadable = -1;   /* test switch: BS_SNAPSHOT_UNREADABLE=1 */
+    if (forceUnreadable < 0) forceUnreadable = getenv("BS_SNAPSHOT_UNREADABLE") != nullptr;
+    if ((uniform || forceUnreadable) && w >= 16 && h >= 16) { pvr_mem_free(mem); return SPRITE_SNAPSHOT_UNREADABLE; }
     /* snapshot slot */
     int32_t snapIdx = -1;
     for (int32_t k = 0; k < (int32_t) arrlen(g_snaps); k++) if (!g_snaps[k].used) { snapIdx = k; break; }
@@ -1313,6 +1456,8 @@ Renderer* DcRenderer_create(const char* texturesPath) {
 
 void DcRenderer_beginScene(Renderer* renderer) {
     DcRenderer* dc = (DcRenderer*) renderer;
+    if (g_texProfEvery < 0) { const char* e = getenv("BS_TEX_PROFILE"); g_texProfEvery = e ? atoi(e) : 0; }
+    texProfReport(dc);
     dc->frame++;
     g_renderSynced = false;
     freeOldSnapshots(dc);
@@ -1325,12 +1470,23 @@ void DcRenderer_beginScene(Renderer* renderer) {
     dc->inScene = true;
 }
 
+/* A "null" frame runs the game's draw events (Undertale keeps game logic in some of them) but
+   renders nothing: no texture uploads, nothing sent to the TA, the previous picture stays on
+   screen. Used to catch up when the game falls behind real time. */
+void DcRenderer_beginNullScene(Renderer* renderer) {
+    DcRenderer* dc = (DcRenderer*) renderer;
+    dc->nullFrame = true;
+    dc->inScene = false;
+    dc->stats.polysFrame = 0;
+}
+
 void DcRenderer_endScene(Renderer* renderer) {
     DcRenderer* dc = (DcRenderer*) renderer;
+    if (dc->nullFrame) { dc->nullFrame = false; return; }
     dc->inScene = false;
     pvr_list_finish();
     pvr_scene_finish();
-    dc->stats.vramFree = (uint32_t) pvr_mem_available();
+    dc->stats.vramFree = g_poolFree;
 }
 
 void DcRenderer_screenRect(Renderer* renderer, float x0, float y0, float x1, float y1, uint32_t argb) {

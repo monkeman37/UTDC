@@ -12,7 +12,7 @@
 
 #include <stdint.h>
 
-#define UTDC_FORMAT_VERSION 3
+#define UTDC_FORMAT_VERSION 4
 
 /* ------------------------------------------------------------------------
  * TEXTURES.BIN
@@ -24,6 +24,10 @@
  *
  * Every page is a power-of-two texture (8..1024 per side) already twiddled
  * for the PowerVR2, in ARGB1555 (binary alpha) or ARGB4444 (soft alpha).
+ * Pages with UTDC_TEXFMT_VQ set are square VQ-compressed textures: a 256-entry
+ * codebook (2x2 texels each, 2 KB) followed by one twiddled index byte per
+ * 2x2 block. They hold only photographic, many-coloured sprite frames, which
+ * VQ reproduces closely at 1/8 of the VRAM.
  *
  * A page payload is a sequence of independent LZ4 blocks (fast to decode on
  * the SH-4), each preceded by a UtdcTexBlock header. Every block decodes to
@@ -36,6 +40,10 @@ enum {
     UTDC_TEXFMT_ARGB4444 = 1,
     UTDC_TEXFMT_RGB565   = 2
 };
+#define UTDC_TEXFMT_VQ 0x80   /* flag on top of the pixel format */
+
+/* VRAM bytes of a page's decoded payload */
+#define UTDC_TEX_PAGE_BYTES(w, h, fmt) (((fmt) & UTDC_TEXFMT_VQ) ? 2048u + (uint32_t)(w) * (uint32_t)(h) / 4u : (uint32_t)(w) * (uint32_t)(h) * 2u)
 
 typedef struct {
     uint32_t magic;

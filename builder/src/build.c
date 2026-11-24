@@ -100,8 +100,8 @@ int utdc_build(BuildContext* ctx, const BuildOptions* opts) {
     build_progress(ctx, 1.0, "Done");
     rc = 0;
 out:
-    remove(texPath); remove(audPath); remove(dwPath); remove(cfgPath);
-    RMDIR(tmp);
+    if (getenv("UTDC_KEEP_TMP")) build_log(ctx, "kept %s", texPath); else { remove(texPath); remove(audPath); remove(dwPath); remove(cfgPath); }
+    if (!getenv("UTDC_KEEP_TMP")) RMDIR(tmp);
     dw_free(&dw);
     return rc;
 }

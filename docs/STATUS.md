@@ -3,7 +3,14 @@
 ## Working (verified in Flycast)
 
 - Boot from GD-ROM image, loading screen, VMU detection; boot to the intro takes ~10 s (data.win chunks are read with one sector-aligned request each; the per-script bytecode packing reuses one compressor)
-- Full asset pipeline: 6,550 texture items → 584 PVR pages (256x256, so a frame only keeps the parts of an atlas it uses in VRAM), 264 sound effects, 179 streams (music + long effects), all at the original 44.1 kHz
+- Full asset pipeline: 6,550 texture items → ~660 PVR pages (256x256, so a frame only keeps the parts of an atlas it uses in VRAM), 264 sound effects, 179 streams (music + long effects), all at the original 44.1 kHz
+- Texture packing keeps every sprite's animation frames together. Photographic, many-coloured sprite frames (Omega Flowey's body parts and attacks; nothing else in the game qualifies) are stored as hardware VQ textures (1/8 of the VRAM, median 30 dB against the original, no visible difference in play); all pixel art, fonts and backgrounds stay lossless
+- Texture pages live in a VRAM pool managed by the renderer: when a page doesn't fit, the cheapest run of neighbouring pages is evicted at once (fragmentation used to stall a frame for over 0.5 s in the Omega Flowey fight)
+- Omega Flowey fight: 30 fps through the whole attack cycle in Flycast (worst one-second averages 26-28 fps), measured in a sandbox that keeps the soul invincible (see TESTING.md). It used to drop to 13-20 fps because each frame of the side stalks' 62-frame animation needed its own 256 KB texture
+- Catch-up frames: when the game falls a full frame behind real time, the next frame runs its draw events without rendering (never twice in a row), so frame-timed music cues stay in step with the music (Omega Flowey's phases used to outlast their tracks)
+- Music starts no longer stall the game: the first disc read and AICA prefill happen on the audio thread, and that thread reads the disc with the audio lock released (each start used to cost 20-40 ms on the game thread)
+- Rotated precise collisions compute the rotation once per test instead of once per pixel (double-precision trig is done in software on the SH-4; Omega Flowey's vines cost up to 80 ms per frame)
+- Alphys's lab monitor shows the live camera feed (a 60x40 crop around the player read back from the screen each frame, ~0.2 ms). Emulators that don't keep the rendered picture in emulated VRAM (Flycast's default settings, likely Redream) return a flat colour there; the runner detects that and shows the game's own static picture, the one the Linux/macOS version uses, instead of a blank monitor. Other screen-snapshot effects are skipped on such emulators rather than drawn black. Real hardware (and Flycast with "Emulate framebuffer") gets the live picture
 - Rendering: sprites (scaled/rotated/coloured), tiles, backgrounds, text with gradients, rectangles,
   lines, primitives, blend modes, views/ports
 - Input (controller → keyboard emulation), naming screen, menus, overworld, battle
@@ -28,10 +35,11 @@
 
 | Area | Detail |
 |---|---|
-| Surfaces | `surface_set_target` draws are skipped and `draw_surface` is a no-op. Undertale draws into a user surface only in the fake-crash screen after the Flowey fight (random noise), which therefore stays black. Screen snapshots are supported (see above) but read the previous frame and cost CPU time. |
+| Surfaces | `surface_set_target` draws are skipped and `draw_surface` is a no-op. Undertale draws into a user surface only in the fake-crash screen after the Flowey fight (random noise), which therefore stays black. Screen snapshots (`sprite_create_from_surface` / `sprite_create_from_screen`) are supported but read the previous frame. |
 | CDI output | Only GDI is written. CD-R users need a DiscJuggler CDI (data/data, scrambled 1ST_READ.BIN, MSINFO-adjusted ISO). |
 | Real hardware | Untested. GD-ROM seek times are much higher than in emulators; texture pages are sector-aligned and read in one request, but room loads may hitch longer. |
 | Redream | Untested (GDI with raw 2352-byte data tracks should load). |
-| Texture loads | The first time a new attack or background appears, its texture pages are read from disc in that frame: single-frame hitches of 40-270 ms (largest at Asriel's first attacks, which use 1024x1024 pages). |
+| Monster dust | Large monsters dissolving (e.g. Vulkin) still cost ~3 frames of 75-100 ms on the Dreamcast build (thousands of particle instances); catch-up frames keep the timing. |
+| Texture loads | The first time a new attack or background appears, its texture pages are read from disc in that frame: single-frame hitches of 40-270 ms (largest at Asriel's first attacks, which use 1024x1024 pages). Catch-up frames keep the game's timing, but the picture still hitches once. |
 | Later areas | Rooms and battles are swept automatically (entered directly, with random input), not played through in story order. Lowest free RAM seen in the battle sweep: ~1.1 MB. |
 | Wizard on Windows | Built with MinGW and not yet run on Windows; the same builder core is tested on Linux. |

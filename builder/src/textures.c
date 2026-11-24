@@ -17,10 +17,17 @@
 
 #include "../third_party/stb/stb_image.h"
 #include "../third_party/lz4/lz4hc.h"
+#include "vq.h"
 
 #define PAGE_SIZE 256  /* small pages: a frame only pays VRAM for the parts of an atlas it uses */
 #define MAX_TEX   1024
 #define GAP       2  /* 1 texel of padding on every side, filled with copies of the edge texels */
+/* Square VQ pages for photographic sprite frames, one 256-entry codebook each. A frame goes to the
+   smallest size it fits in, so small animations get a codebook shared by only a few of their own
+   frames (better quality), and wide ones (Omega Flowey's side stalks) still fit. */
+#define VQ_PAGE_BIG 512
+static const int kVqSizes[3] = { 128, 256, 512 };
+#define VQ_MIN_COLORS 200 /* a sprite frame with more distinct colours than this is "photographic" */
 
 typedef struct { int x, y, w; } SkyNode;
 
@@ -29,7 +36,8 @@ typedef struct {
     int w, h;
     int usedW, usedH;
     int soft;                /* page holds soft-alpha items (ARGB4444) */
-    SkyNode nodes[PAGE_SIZE + 2];
+    int vq;                  /* page is stored VQ-compressed */
+    SkyNode nodes[VQ_PAGE_BIG + 2];
     int nodeCount;
     int itemCount;
 } OpenPage;
@@ -44,6 +52,7 @@ typedef struct {
     UtdcTexItem* items;
     uint32_t largestRaw, largestComp;
     uint64_t rawTotal, compTotal;
+    int vqPages; double vqErrSum; double vqErrMax; uint64_t vqVramSaved;
 } TexOut;
 
 static int pow2ceil(int v) { int p = 8; while (p < v) p <<= 1; return p; }
@@ -112,6 +121,7 @@ static uint32_t twid(uint32_t v) {
 static uint16_t conv_px(const uint8_t* c, int soft) {
     uint8_t r = c[0], g = c[1], b = c[2], a = c[3];
     if (soft) {
+        if ((a >> 4) == 0) return 0;   /* invisible: no stray colour bits (keeps VQ blocks clean) */
         return (uint16_t)(((a >> 4) << 12) | ((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4));
     }
     if (a < 128) return 0;
@@ -124,18 +134,39 @@ static int finish_page(TexOut* out, OpenPage* p, BuildContext* ctx) {
     int w = pow2ceil(p->usedW), h = pow2ceil(p->usedH);
     if (w > p->w) w = p->w;
     if (h > p->h) h = p->h;
-    uint16_t* tw = (uint16_t*)calloc((size_t)w * h, 2);
-    if (!tw) return -1;
-    int mn = w < h ? w : h, mask = mn - 1;
-    for (int y = 0; y < h; y++) {
-        for (int x = 0; x < w; x++) {
-            uint16_t px = conv_px(p->rgba + ((size_t)y * p->w + x) * 4, p->soft);
-            uint32_t idx = (twid((uint32_t)(y & mask)) | (twid((uint32_t)(x & mask)) << 1)) + (uint32_t)((x / mn + y / mn) * mn * mn);
-            tw[idx] = px;
+    uint16_t* tw;
+    uint32_t rawBytes;
+    if (p->vq) {
+        /* square VQ page: codebook + twiddled indices */
+        int sz = w > h ? w : h;
+        if (sz < 16) sz = 16;
+        w = h = sz;
+        uint16_t* lin = (uint16_t*)calloc((size_t)sz * sz, 2);
+        rawBytes = UTDC_TEX_PAGE_BYTES(sz, sz, UTDC_TEXFMT_VQ);
+        tw = (uint16_t*)calloc(rawBytes / 2 + 1, 2);
+        if (!lin || !tw) { free(lin); free(tw); return -1; }
+        for (int y = 0; y < sz; y++)
+            for (int x = 0; x < sz; x++)
+                lin[(size_t)y * sz + x] = conv_px(p->rgba + ((size_t)y * p->w + x) * 4, p->soft);
+        double err = 0;
+        if (vq_encode(lin, sz, p->soft, (uint8_t*)tw, &err)) { free(lin); free(tw); return -1; }
+        free(lin);
+        out->vqPages++; out->vqErrSum += err; if (err > out->vqErrMax) out->vqErrMax = err;
+        out->vqVramSaved += (uint64_t)sz * sz * 2 - rawBytes;
+    } else {
+        tw = (uint16_t*)calloc((size_t)w * h, 2);
+        if (!tw) return -1;
+        int mn = w < h ? w : h, mask = mn - 1;
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                uint16_t px = conv_px(p->rgba + ((size_t)y * p->w + x) * 4, p->soft);
+                uint32_t idx = (twid((uint32_t)(y & mask)) | (twid((uint32_t)(x & mask)) << 1)) + (uint32_t)((x / mn + y / mn) * mn * mn);
+                tw[idx] = px;
+            }
         }
+        rawBytes = (uint32_t) w * h * 2;
     }
     /* LZ4-HC in independent 32 KB blocks: decodes ~10x faster than zlib on the SH-4 */
-    uint32_t rawBytes = (uint32_t) w * h * 2;
     uint32_t maxOut = 0;
     for (uint32_t o = 0; o < rawBytes; o += UTDC_TEX_BLOCK_RAW) {
         uint32_t n = rawBytes - o < UTDC_TEX_BLOCK_RAW ? rawBytes - o : UTDC_TEX_BLOCK_RAW;
@@ -159,8 +190,9 @@ static int finish_page(TexOut* out, OpenPage* p, BuildContext* ctx) {
     }
     DonePage* d = &out->pages[out->count++];
     d->comp = (uint8_t*)realloc(comp, cl); d->compSize = (uint32_t)cl;
-    d->w = (uint16_t)w; d->h = (uint16_t)h; d->fmt = p->soft ? UTDC_TEXFMT_ARGB4444 : UTDC_TEXFMT_ARGB1555;
-    uint32_t raw = (uint32_t)w * h * 2;
+    d->w = (uint16_t)w; d->h = (uint16_t)h; d->fmt = (uint8_t)((p->soft ? UTDC_TEXFMT_ARGB4444 : UTDC_TEXFMT_ARGB1555) | (p->vq ? UTDC_TEXFMT_VQ : 0));
+    free(tw);
+    uint32_t raw = rawBytes;
     if (raw > out->largestRaw) out->largestRaw = raw;
     if (d->compSize > out->largestComp) out->largestComp = d->compSize;
     out->rawTotal += raw; out->compTotal += cl;
@@ -173,12 +205,24 @@ static int finish_page(TexOut* out, OpenPage* p, BuildContext* ctx) {
 typedef struct { uint32_t tpag; int dupOf; int soft; } ItemInfo;
 
 static const DataWinFile* item_cmp_dw;
+static const uint16_t* item_cmp_groupH;   /* per TPAG: tallest frame of its sprite (own height if none) */
+/* Packing order: tallest groups first (skyline packing stays tight), and all frames of one sprite
+   next to each other in frame order. An animation then cycles inside one or a few pages instead
+   of touching a different page every frame, which keeps the per-frame VRAM working set small. */
 static int cmp_items(const void* a, const void* b) {
-    const DwTpag* ta = &item_cmp_dw->tpag[*(const uint32_t*)a];
-    const DwTpag* tb = &item_cmp_dw->tpag[*(const uint32_t*)b];
+    uint32_t ia = *(const uint32_t*)a, ib = *(const uint32_t*)b;
+    if (item_cmp_groupH[ia] != item_cmp_groupH[ib]) return (int)item_cmp_groupH[ib] - (int)item_cmp_groupH[ia];
+    int32_t sa = item_cmp_dw->tpagSprite[ia], sb = item_cmp_dw->tpagSprite[ib];
+    if (sa != sb) {
+        if (sa < 0 || sb < 0) return sa < 0 ? 1 : -1;   /* sprites before loose items of the same height */
+        return sa < sb ? -1 : 1;
+    }
+    if (sa >= 0 && item_cmp_dw->tpagFrame[ia] != item_cmp_dw->tpagFrame[ib]) return item_cmp_dw->tpagFrame[ia] - item_cmp_dw->tpagFrame[ib];
+    const DwTpag* ta = &item_cmp_dw->tpag[ia];
+    const DwTpag* tb = &item_cmp_dw->tpag[ib];
     if (ta->srcH != tb->srcH) return tb->srcH - ta->srcH;
     if (ta->srcW != tb->srcW) return tb->srcW - ta->srcW;
-    return (int)(*(const uint32_t*)a) - (int)(*(const uint32_t*)b);
+    return (int)ia - (int)ib;
 }
 
 int build_textures(BuildContext* ctx, const DataWinFile* dw, const char* outPath) {
@@ -186,15 +230,34 @@ int build_textures(BuildContext* ctx, const DataWinFile* dw, const char* outPath
     out.items = (UtdcTexItem*)calloc(dw->tpagCount ? dw->tpagCount : 1, sizeof(UtdcTexItem));
     for (uint32_t i = 0; i < dw->tpagCount; i++) out.items[i].page = UTDC_TEX_NO_PAGE;
 
-    OpenPage open[2];
-    for (int s = 0; s < 2; s++) {
-        memset(&open[s], 0, sizeof(OpenPage));
-        open[s].w = open[s].h = PAGE_SIZE; open[s].soft = s;
-        open[s].rgba = (uint8_t*)calloc(PAGE_SIZE * PAGE_SIZE, 4);
+    /* open[0]/[1]: lossless pages (binary/soft alpha); open[2..7]: VQ pages for photographic
+       sprite frames, 128/256/512 texels square, binary/soft alpha. */
+    OpenPage* open = (OpenPage*)calloc(8, sizeof(OpenPage));
+    for (int s = 0; s < 8; s++) {
+        int vq = s >= 2;
+        open[s].w = open[s].h = vq ? kVqSizes[(s - 2) / 2] : PAGE_SIZE; open[s].soft = s & 1; open[s].vq = vq;
+        open[s].rgba = (uint8_t*)calloc((size_t)open[s].w * open[s].h, 4);
         sky_reset(&open[s]);
     }
     /* page index that each open page will get once finished */
     uint32_t* order = (uint32_t*)malloc((dw->tpagCount + 1) * sizeof(uint32_t));
+    uint16_t* groupH = (uint16_t*)calloc(dw->tpagCount + 1, sizeof(uint16_t));
+    {
+        /* tallest frame per sprite */
+        int32_t maxSprite = -1;
+        for (uint32_t i = 0; i < dw->tpagCount; i++) if (dw->tpagSprite[i] > maxSprite) maxSprite = dw->tpagSprite[i];
+        uint16_t* sprH = (uint16_t*)calloc((size_t)maxSprite + 2, sizeof(uint16_t));
+        for (uint32_t i = 0; i < dw->tpagCount; i++) {
+            int32_t sidx = dw->tpagSprite[i];
+            if (sidx >= 0 && dw->tpag[i].srcH > sprH[sidx]) sprH[sidx] = dw->tpag[i].srcH;
+        }
+        for (uint32_t i = 0; i < dw->tpagCount; i++) {
+            int32_t sidx = dw->tpagSprite[i];
+            groupH[i] = sidx >= 0 ? sprH[sidx] : dw->tpag[i].srcH;
+        }
+        free(sprH);
+    }
+    item_cmp_groupH = groupH;
     /* Pending assignment: items placed into an open page get their final page id when it closes */
     int32_t* pendingSlot = (int32_t*)malloc((dw->tpagCount + 1) * sizeof(int32_t));
     for (uint32_t i = 0; i < dw->tpagCount; i++) pendingSlot[i] = -1;
@@ -241,11 +304,46 @@ int build_textures(BuildContext* ctx, const DataWinFile* dw, const char* outPath
             if (dw_ > MAX_TEX) dw_ = MAX_TEX;
             if (dh_ > MAX_TEX) dh_ = MAX_TEX;
 
+            /* photographic sprite frame (many colours): VQ page */
+            int photo = 0;
+            if (dw->tpagSprite[ti] >= 0 && dw_ + 4 <= VQ_PAGE_BIG && dh_ + 4 <= VQ_PAGE_BIG && (int64_t)dw_ * dh_ > VQ_MIN_COLORS) {
+                uint32_t seen[512]; int nseen = 0;
+                memset(seen, 0, sizeof seen);
+                for (int y = 0; y < sh && nseen <= VQ_MIN_COLORS; y++)
+                    for (int x = 0; x < sw && nseen <= VQ_MIN_COLORS; x++) {
+                        const uint8_t* c = img + ((size_t)(sy + y) * pw + sx + x) * 4;
+                        uint32_t v = (uint32_t)c[0] | ((uint32_t)c[1] << 8) | ((uint32_t)c[2] << 16) | ((uint32_t)c[3] << 24);
+                        if (c[3] == 0) v = 0;
+                        uint32_t hsh = (v * 2654435761u) >> 23, probe = 0;
+                        while (probe < 512) {
+                            uint32_t slot = (hsh + probe) & 511;
+                            if (seen[slot] == v + 1u) break;
+                            if (seen[slot] == 0) { seen[slot] = v + 1u; nseen++; break; }
+                            probe++;
+                        }
+                    }
+                photo = nseen > VQ_MIN_COLORS;
+            }
+
             OpenPage* target;
             OpenPage big;
             int px, py;
-            int isBig = (dw_ + GAP > PAGE_SIZE || dh_ + GAP > PAGE_SIZE);
-            if (isBig) {
+            int sizeClass = 0;
+            while (sizeClass < 2 && (dw_ + 4 > kVqSizes[sizeClass] || dh_ + 4 > kVqSizes[sizeClass])) sizeClass++;
+            int slotId = photo ? 2 + soft + 2 * sizeClass : soft;
+            int isBig = !photo && (dw_ + GAP > PAGE_SIZE || dh_ + GAP > PAGE_SIZE);
+            if (photo) {
+                /* 2 texels of padding, item at even coordinates so 2x2 blocks never straddle items */
+                int aw = (dw_ + 4 + 1) & ~1, ah = (dh_ + 4 + 1) & ~1;
+                target = &open[slotId];
+                if (!sky_fit(target, aw, ah, &px, &py)) {
+                    int id = out.count;
+                    if (finish_page(&out, target, ctx)) goto fail;
+                    for (uint32_t q = 0; q < dw->tpagCount; q++) if (pendingSlot[q] == slotId) { out.items[q].page = (uint16_t)id; pendingSlot[q] = -1; }
+                    if (!sky_fit(target, aw, ah, &px, &py)) { build_log(ctx, "warning: TPAG %u too big", ti); continue; }
+                }
+                px += 2; py += 2;
+            } else if (isBig) {
                 memset(&big, 0, sizeof(big));
                 big.w = pow2ceil(dw_); big.h = pow2ceil(dh_); big.soft = soft;
                 big.rgba = (uint8_t*)calloc((size_t)big.w * big.h, 4);
@@ -295,16 +393,19 @@ int build_textures(BuildContext* ctx, const DataWinFile* dw, const char* outPath
                 free(big.rgba);
                 out.items[ti].page = (uint16_t)id;
             } else {
-                pendingSlot[ti] = soft;
+                pendingSlot[ti] = slotId;
             }
         }
         stbi_image_free(img);
     }
-    for (int s = 0; s < 2; s++) {
+    for (int s = 0; s < 8; s++) {
         int id = out.count;
         if (finish_page(&out, &open[s], ctx)) goto fail;
         for (uint32_t q = 0; q < dw->tpagCount; q++) if (pendingSlot[q] == s) { out.items[q].page = (uint16_t)id; pendingSlot[q] = -1; }
     }
+    if (out.vqPages)
+        build_log(ctx, "Textures: %d photographic pages stored VQ-compressed (%.1f MB less VRAM, mean error %.1f, worst page %.1f)",
+                  out.vqPages, out.vqVramSaved / 1048576.0, out.vqErrSum / out.vqPages, out.vqErrMax);
 
     {
         FILE* f = fopen(outPath, "wb");
@@ -336,16 +437,26 @@ int build_textures(BuildContext* ctx, const DataWinFile* dw, const char* outPath
         fclose(f);
         if (bad) { build_log(ctx, "error: write failed for %s", outPath); goto fail; }
     }
+    if (getenv("UTDC_PAGEMAP")) {   /* developer diagnostics: item -> page/sprite/frame map */
+        FILE* m = fopen(getenv("UTDC_PAGEMAP"), "w");
+        if (m) {
+            for (uint32_t i = 0; i < dw->tpagCount; i++)
+                fprintf(m, "%u %u %d %d %u %u %u\n", i, out.items[i].page, dw->tpagSprite[i], dw->tpagFrame[i], out.items[i].w, out.items[i].h, out.items[i].page < out.count ? out.pages[out.items[i].page].compSize : 0);
+            fclose(m);
+        }
+    }
     build_log(ctx, "Textures: %d Dreamcast pages, %.1f MB raw -> %.1f MB compressed", out.count, out.rawTotal / 1048576.0, out.compTotal / 1048576.0);
     ctx->stats.texPages = out.count;
 
     for (int i = 0; i < out.count; i++) free(out.pages[i].comp);
-    free(out.pages); free(out.items); free(order); free(pendingSlot);
-    free(open[0].rgba); free(open[1].rgba);
+    free(out.pages); free(out.items); free(order); free(groupH); free(pendingSlot);
+    for (int s = 0; s < 8; s++) free(open[s].rgba);
+    free(open);
     return 0;
 fail:
     for (int i = 0; i < out.count; i++) free(out.pages[i].comp);
-    free(out.pages); free(out.items); free(order); free(pendingSlot);
-    free(open[0].rgba); free(open[1].rgba);
+    free(out.pages); free(out.items); free(order); free(groupH); free(pendingSlot);
+    for (int s = 0; s < 8; s++) free(open[s].rgba);
+    free(open);
     return -1;
 }

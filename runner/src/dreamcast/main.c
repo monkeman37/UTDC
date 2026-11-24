@@ -414,11 +414,25 @@ int main(MAYBE_UNUSED int argc, MAYBE_UNUSED char** argv) {
     uint64_t frameCounter = 0;
     uint64_t lastLog = lastFrame;
     uint32_t lastFlipVbl = g_vblanks;
+    /* real-time catch-up state (see the null frame below); BS_NO_CATCHUP=1 disables it */
+    const bool catchUp = getenv("BS_NO_CATCHUP") == nullptr;
+    int64_t lagUs = 0;
+    bool lastWasNull = false;
+    uint32_t nullFrames = 0;
+    uint64_t prevFrameStart = 0;
 
     while (!runner->shouldExit) {
         uint64_t frameStart = timer_us_gettime64();
         runner->deltaTime = (GMLReal) (frameStart - lastFrame);
         lastFrame = frameStart;
+        uint32_t roomSpeedNow = runner->currentRoom && runner->currentRoom->speed ? runner->currentRoom->speed : 30;
+        int64_t frameUs = 1000000 / (int64_t) roomSpeedNow;
+        if (prevFrameStart) {
+            int64_t took = (int64_t) (frameStart - prevFrameStart);
+            if (took > 250000) lagUs = 0;                       /* loading hitch: don't fast-forward */
+            else { lagUs += took - frameUs; if (lagUs < 0) lagUs = 0; if (lagUs > 3 * frameUs) lagUs = 3 * frameUs; }
+        }
+        prevFrameStart = frameStart;
 
         if (!pollInput(runner)) break;
         if (playback) InputRecording_processFrame(playback, runner->keyboard, runner->frameCount);
@@ -434,7 +448,15 @@ int main(MAYBE_UNUSED int argc, MAYBE_UNUSED char** argv) {
         Runner_step(runner);
         uint64_t t1 = timer_us_gettime64();
 
-        DcRenderer_beginScene(renderer);
+        /* Catch-up: when the game has fallen a full frame behind real time, this frame runs its
+           draw events without rendering, so game logic (and every frame-timed music cue, e.g.
+           Omega Flowey's phase changes) keeps real-time pace through a heavy moment. Never two
+           in a row, and loading hitches (room changes, >250 ms frames) are forgiven rather than
+           fast-forwarded. */
+        bool nullFrame = catchUp && lagUs >= frameUs && !lastWasNull;
+        if (nullFrame) { DcRenderer_beginNullScene(renderer); nullFrames++; }
+        else DcRenderer_beginScene(renderer);
+        lastWasNull = nullFrame;
         Runner_drawPre(runner, 640, 480);
         Runner_beginFrame(runner, gameW, gameH, 640, 480, 640, 480);
         Runner_drawViews(runner, gameW, gameH, false);
@@ -493,6 +515,7 @@ int main(MAYBE_UNUSED int argc, MAYBE_UNUSED char** argv) {
             uint64_t rc0 = timer_us_gettime64();
             bool changing = runner->pendingRoom != -1;
             Runner_handlePendingRoomChange(runner);
+            if (changing) { lagUs = 0; prevFrameStart = 0; }
             if (changing) logInfo("DC: room change took %u ms\n", (unsigned) ((timer_us_gettime64() - rc0) / 1000));
         }
         if (runner->currentRoom == nullptr) break;
@@ -516,8 +539,8 @@ int main(MAYBE_UNUSED int argc, MAYBE_UNUSED char** argv) {
             struct mallinfo mi = mallinfo();
             const BytecodeCacheStats* bc = BytecodeCache_stats();
             logInfo("DC: bytecode cache %u KB, hits %u misses %u evictions %u\n", bc->cachedBytes / 1024, bc->hits, bc->misses, bc->evictions);
-            logInfo("DC: frame %llu fps %d step %.1fms draw %.1fms polys %u pages %u (loads %u, evictions %u) vram %uKB heap %dKB free %uKB room %s\n",
-                    (unsigned long long) frameCounter, stats.fps, (double) stats.stepMs, (double) stats.drawMs,
+            logInfo("DC: frame %llu fps %d (catch-up %u) step %.1fms draw %.1fms polys %u pages %u (loads %u, evictions %u) vram %uKB heap %dKB free %uKB room %s\n",
+                    (unsigned long long) frameCounter, stats.fps, (unsigned) nullFrames, (double) stats.stepMs, (double) stats.drawMs,
                     rs->polysFrame, rs->pagesLoaded, rs->pageLoadsTotal, rs->evictions, rs->vramFree / 1024, mi.uordblks / 1024, freeRamKB(),
                     runner->currentRoom ? runner->currentRoom->name : "?");
             {
@@ -531,7 +554,8 @@ int main(MAYBE_UNUSED int argc, MAYBE_UNUSED char** argv) {
         /* Frame pacing: hold each game frame for 60/room_speed vblanks (2 at 30 fps), so the
            display shows a perfectly even cadence. If a frame overruns we simply continue. */
         uint32_t vblPerFrame = roomSpeed >= 60 ? 1 : (60 + roomSpeed / 2) / roomSpeed;
-        while (g_vblanks - lastFlipVbl < vblPerFrame) thd_pass();
+        if (!nullFrame && lagUs < frameUs)
+            while (g_vblanks - lastFlipVbl < vblPerFrame) thd_pass();   /* behind schedule: don't wait */
         lastFlipVbl = g_vblanks;
     }
 

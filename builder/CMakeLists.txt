@@ -25,7 +25,7 @@ add_custom_command(
   COMMENT "Embedding Dreamcast runner payload")
 
 set(CORE_SRC
-  src/build.c src/datawin.c src/textures.c src/audio.c src/disc.c src/impl.c
+  src/build.c src/datawin.c src/textures.c src/vq.c src/audio.c src/disc.c src/impl.c
   third_party/miniz/miniz.c third_party/miniz/miniz_tdef.c third_party/miniz/miniz_tinfl.c
   third_party/lz4/lz4.c third_party/lz4/lz4hc.c
   ${PAYLOAD_C})

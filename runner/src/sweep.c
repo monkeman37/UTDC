@@ -105,10 +105,36 @@ void Sweep_tick(Runner* runner) {
         if (p < 0.4f) p = 0.4f;
         runner->audioSystem->vtable->setSoundPitch(runner->audioSystem, g_soundId, p);
     }
-    // keep the player alive in battles
-    if (g_mode == 1) {
+    // BS_SWEEP_DEBUG: turn on the game's own debug flag (enables developer attack keys in some fights)
+    if (getenv("BS_SWEEP_DEBUG") && frame == g_boot) setGlobal(runner, "debug", RValue_makeInt32(1));
+    // BS_SWEEP_CENSUS=N: every N frames, log the most numerous objects (attribution for slow frames)
+    if (getenv("BS_SWEEP_CENSUS")) {
+        int every = atoi(getenv("BS_SWEEP_CENSUS")); if (every <= 0) every = 30;
+        if (frame % every == 0) {
+            int32_t n = (int32_t) arrlen(runner->instances);
+            int32_t nObj = (int32_t) runner->dataWin->objt.count;
+            static int32_t* counts; static int32_t countsCap;
+            if (countsCap < nObj) { counts = (int32_t*) realloc(counts, (size_t) nObj * sizeof(int32_t)); countsCap = nObj; }
+            memset(counts, 0, (size_t) nObj * sizeof(int32_t));
+            int32_t alive = 0;
+            for (int32_t i = 0; i < n; i++) { Instance* in = runner->instances[i]; if (!in->destroyed && in->objectIndex >= 0 && in->objectIndex < nObj) { counts[in->objectIndex]++; alive++; } }
+            char buf[400]; int len = snprintf(buf, sizeof buf, "CENSUS f%d n=%d:", frame, (int) alive);
+            for (int t = 0; t < 6; t++) {
+                int32_t best = -1;
+                for (int32_t o = 0; o < nObj; o++) if (counts[o] > 0 && (best < 0 || counts[o] > counts[best])) best = o;
+                if (best < 0) break;
+                len += snprintf(buf + len, sizeof buf - (size_t) len, " %s=%d", runner->dataWin->objt.objects[best].name, (int) counts[best]);
+                counts[best] = 0;
+                if (len > 340) break;
+            }
+            logInfo("%s\n", buf);
+        }
+    }
+    // keep the player alive in battles (BS_SWEEP_GOD: in every mode)
+    if (g_mode == 1 || getenv("BS_SWEEP_GOD")) {
         RValue mx = getGlobal(runner, "maxhp");
         if (mx.type == RVALUE_REAL || mx.type == RVALUE_INT32) setGlobal(runner, "hp", mx);
+        if (getenv("BS_SWEEP_GOD")) { setGlobal(runner, "invc", RValue_makeInt32(30)); setGlobal(runner, "hp", RValue_makeInt32(9999)); setGlobal(runner, "my_hp", RValue_makeInt32(9999)); setGlobal(runner, "my_inv", RValue_makeInt32(30)); }
     }
     if (getenv("BS_SWEEP_NOINPUT")) return;
     // mash inputs

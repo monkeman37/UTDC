@@ -416,9 +416,17 @@ static inline bool Collision_pointInInstance(Sprite* spr, Instance* inst, GMLRea
 
     // Inverse of CW rotation is standard CCW rotation (positive angle)
     if (GMLReal_fabs(inst->imageAngle) > 0.0001) {
-        GMLReal rad = inst->imageAngle * M_PI / 180.0;
-        GMLReal cs = GMLReal_cos(rad);
-        GMLReal sn = GMLReal_sin(rad);
+        // Pixel loops call this with the same angle many times in a row: remember the last
+        // angle's cos/sin (double trig is very slow on the Dreamcast's SH-4). Same values.
+        static GMLReal cachedAngle = 0.0, cachedCs = 1.0, cachedSn = 0.0;
+        if (inst->imageAngle != cachedAngle) {
+            GMLReal rad = inst->imageAngle * M_PI / 180.0;
+            cachedCs = GMLReal_cos(rad);
+            cachedSn = GMLReal_sin(rad);
+            cachedAngle = inst->imageAngle;
+        }
+        GMLReal cs = cachedCs;
+        GMLReal sn = cachedSn;
         GMLReal rx = cs * dx - sn * dy;
         GMLReal ry = sn * dx + cs * dy;
         dx = rx;
@@ -456,6 +464,53 @@ static inline bool Collision_pointInInstance(Sprite* spr, Instance* inst, GMLRea
         return (mask[my * bytesPerRow + (mx >> 3)] & (1 << (7 - (mx & 7)))) != 0;
     }
 
+    return true;
+}
+
+// Per-instance part of Collision_pointInInstance, computed once per overlap test instead of once
+// per pixel: the rotation's cos/sin are double-precision trig, which is very slow on CPUs without
+// fast double maths (the Dreamcast's SH-4 does it in software). Results are bit-identical to
+// Collision_pointInInstance: same operations in the same order, only the trig is hoisted.
+typedef struct { bool ok, rotated; GMLReal cs, sn; } CollisionPointXform;
+
+static inline CollisionPointXform Collision_pointXform(Sprite* spr, Instance* inst) {
+    CollisionPointXform xf = { false, false, 1.0, 0.0 };
+    if (spr == nullptr) return xf;
+    if (0.0001 > GMLReal_fabs(inst->imageXscale) || 0.0001 > GMLReal_fabs(inst->imageYscale)) return xf;
+    xf.ok = true;
+    if (GMLReal_fabs(inst->imageAngle) > 0.0001) {
+        GMLReal rad = inst->imageAngle * M_PI / 180.0;
+        xf.rotated = true; xf.cs = GMLReal_cos(rad); xf.sn = GMLReal_sin(rad);
+    }
+    return xf;
+}
+
+static inline bool Collision_pointInInstanceX(Sprite* spr, Instance* inst, const CollisionPointXform* xf, GMLReal px, GMLReal py) {
+    if (!xf->ok) return false;
+    GMLReal dx = px - inst->x;
+    GMLReal dy = py - inst->y;
+    if (xf->rotated) {
+        GMLReal rx = xf->cs * dx - xf->sn * dy;
+        GMLReal ry = xf->sn * dx + xf->cs * dy;
+        dx = rx;
+        dy = ry;
+    }
+    GMLReal localX = dx / inst->imageXscale + (GMLReal) spr->originX;
+    GMLReal localY = dy / inst->imageYscale + (GMLReal) spr->originY;
+    int32_t ix = (int32_t) localX;
+    int32_t iy = (int32_t) localY;
+    if (0 > ix || 0 > iy || ix >= (int32_t) spr->width || iy >= (int32_t) spr->height) return false;
+    if (spr->bboxMode != 1 &&
+        (ix < spr->marginLeft || ix > spr->marginRight || iy < spr->marginTop || iy > spr->marginBottom)) return false;
+    if (Collision_hasFrameMasks(spr)) {
+        uint32_t frameIdx = ((uint32_t) inst->imageIndex) % spr->maskCount;
+        uint8_t* mask = spr->masks[frameIdx];
+        int32_t mx = ix - spr->maskOffsetX;
+        int32_t my = iy - spr->maskOffsetY;
+        if (0 > mx || 0 > my || mx >= (int32_t) spr->maskWidth || my >= (int32_t) spr->maskHeight) return false;
+        uint32_t bytesPerRow = (spr->maskWidth + 7) / 8;
+        return (mask[my * bytesPerRow + (mx >> 3)] & (1 << (7 - (mx & 7)))) != 0;
+    }
     return true;
 }
 
@@ -551,13 +606,16 @@ static inline bool Collision_instancesOverlapPrecise(Runner* runner, Instance* a
         sampleOffset = 0.5;
     }
 
+    CollisionPointXform xfA = Collision_pointXform(sprA, a);
+    CollisionPointXform xfB = Collision_pointXform(sprB, b);
+    if (!xfA.ok || !xfB.ok) return false;
     for (int32_t py = startY; (compatMode ? py <= endY : py < endY); py++) {
         for (int32_t px = startX; (compatMode ? px <= endX : px < endX); px++) {
             GMLReal wpx = (GMLReal) px + sampleOffset;
             GMLReal wpy = (GMLReal) py + sampleOffset;
 
-            if (!Collision_pointInInstance(sprA, a, wpx, wpy)) continue;
-            if (!Collision_pointInInstance(sprB, b, wpx, wpy)) continue;
+            if (!Collision_pointInInstanceX(sprA, a, &xfA, wpx, wpy)) continue;
+            if (!Collision_pointInInstanceX(sprB, b, &xfB, wpx, wpy)) continue;
             return true;
         }
     }

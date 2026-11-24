@@ -1,5 +1,5 @@
 /* Minimal GameMaker data.win reader used by the ROM builder.
- * Only reads what the builder needs: chunk table, TXTR, TPAG, SOND, AUDO.
+ * Only reads what the builder needs: chunk table, TXTR, TPAG, SPRT (frame ownership), SOND, AUDO.
  * SPDX-License-Identifier: AGPL-3.0-or-later */
 #ifndef UTDC_DATAWIN_H
 #define UTDC_DATAWIN_H
@@ -53,6 +53,9 @@ typedef struct {
     DwTexture* tex;     uint32_t texCount;
     DwSound*   sound;   uint32_t soundCount;
     DwAudio*   audio;   uint32_t audioCount;
+    /* per TPAG: owning sprite (-1 for fonts/backgrounds) and frame index, from SPRT */
+    int32_t*   tpagSprite;
+    int32_t*   tpagFrame;
 } DataWinFile;
 
 /* Returns 0 on success; on failure, writes a message into err. */

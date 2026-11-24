@@ -75,6 +75,30 @@ int dw_load(DataWinFile* dw, const char* path, char* err, size_t errLen) {
         t->bndW = rd16(q + 16); t->bndH = rd16(q + 18); t->page = (int16_t)rd16(q + 20);
     }
 
+    /* SPRT: which sprite/frame each TPAG belongs to (lets the packer keep animation frames
+       together). GMS 1.x layout: 14 u32 header fields, then u32 frame count and frame TPAG
+       pointers; a count of 0xFFFFFFFF marks the GMS2 "special" layout, which is skipped. */
+    dw->tpagSprite = (int32_t*)malloc((dw->tpagCount ? dw->tpagCount : 1) * sizeof(int32_t));
+    dw->tpagFrame = (int32_t*)malloc((dw->tpagCount ? dw->tpagCount : 1) * sizeof(int32_t));
+    for (uint32_t i = 0; i < dw->tpagCount; i++) { dw->tpagSprite[i] = -1; dw->tpagFrame[i] = 0; }
+    {
+        const uint8_t* tp; uint32_t tn = ptrlist(dw, dw_chunk(dw, "TPAG"), &tp);
+        const uint8_t* sp; uint32_t sn = ptrlist(dw, dw_chunk(dw, "SPRT"), &sp);
+        for (uint32_t s = 0; s < sn; s++) {
+            uint32_t ptr = rd32(sp + s * 4);
+            if (!ptr || (size_t)ptr + 64 > dw->size) continue;
+            uint32_t cnt = rd32(dw->data + ptr + 56);
+            if (cnt == 0xFFFFFFFFu || cnt > 4096 || (size_t)ptr + 60 + (size_t)cnt * 4 > dw->size) continue;
+            for (uint32_t f = 0; f < cnt; f++) {
+                uint32_t tptr = rd32(dw->data + ptr + 60 + f * 4);
+                /* TPAG entries are stored in order, so the pointer list is sorted: binary search */
+                uint32_t lo = 0, hi = tn;
+                while (lo < hi) { uint32_t mid = (lo + hi) / 2; if (rd32(tp + mid * 4) < tptr) lo = mid + 1; else hi = mid; }
+                if (lo < tn && rd32(tp + lo * 4) == tptr && dw->tpagSprite[lo] < 0) { dw->tpagSprite[lo] = (int32_t)s; dw->tpagFrame[lo] = (int32_t)f; }
+            }
+        }
+    }
+
     /* TXTR: GMS 1.x entries are {u32 scaled, u32 blobOffset}; GMS2 adds generatedMips etc. */
     const DwChunk* txtr = dw_chunk(dw, "TXTR");
     n = ptrlist(dw, txtr, &p);
@@ -133,7 +157,7 @@ int dw_load(DataWinFile* dw, const char* path, char* err, size_t errLen) {
 }
 
 void dw_free(DataWinFile* dw) {
-    free(dw->data); free(dw->tpag); free(dw->tex); free(dw->sound); free(dw->audio);
+    free(dw->data); free(dw->tpag); free(dw->tpagSprite); free(dw->tpagFrame); free(dw->tex); free(dw->sound); free(dw->audio);
     memset(dw, 0, sizeof(*dw));
 }
 

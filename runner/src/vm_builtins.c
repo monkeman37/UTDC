@@ -13697,7 +13697,58 @@ static RValue builtin_sprite_create_from_surface(VMContext* ctx, RValue* args, M
     int32_t xorig = RValue_toInt32(args[7]);
     int32_t yorig = RValue_toInt32(args[8]);
 
+    static uint32_t origSpriteCount;
+    if (!origSpriteCount) origSpriteCount = ctx->dataWin->sprt.count;
     int32_t result = runner->renderer->vtable->createSpriteFromSurface(runner->renderer, surfaceId, x, y, w, h, removeback, smooth, xorig, yorig);
+    if (result == SPRITE_SNAPSHOT_UNREADABLE) {
+        result = -1;   /* other screen-snapshot effects are skipped rather than drawn black */
+        /* Alphys's lab monitor (obj_labcamera): show the game's own fallback picture, the one the
+           Linux/macOS version uses, placed where that version draws it (1 px up and left). */
+        Instance* caller = ctx->currentCallFrame ? ctx->currentCallFrame->self : nullptr;
+        DataWin* dw = ctx->dataWin;
+        if (caller && caller->objectIndex >= 0 && (uint32_t) caller->objectIndex < dw->objt.count &&
+            strcmp(dw->objt.objects[caller->objectIndex].name, "obj_labcamera") == 0) {
+            static int32_t emergency = -2;
+            if (emergency == -2) {
+                emergency = -1;
+                for (uint32_t i = 0; i < origSpriteCount; i++)
+                    if (dw->sprt.sprites[i].name && strcmp(dw->sprt.sprites[i].name, "spr_labcamera_emergency") == 0) { emergency = (int32_t) i; break; }
+            }
+            if (emergency >= 0 && dw->sprt.sprites[emergency].textureCount > 0) {
+                Sprite src = dw->sprt.sprites[emergency];
+                uint32_t idx = DataWin_allocSpriteSlot(dw, origSpriteCount);
+                Sprite* copy = &dw->sprt.sprites[idx];
+                const char* keepName = copy->name;
+                *copy = src;
+                copy->name = keepName;
+                copy->originX = src.originX + 1;
+                copy->originY = src.originY + 1;
+                copy->tpagIndices = (int32_t*) safeMalloc(sizeof(int32_t) * src.textureCount);
+                memcpy(copy->tpagIndices, src.tpagIndices, sizeof(int32_t) * src.textureCount);
+                copy->maskCount = 0; copy->masks = nullptr;
+                result = (int32_t) idx;
+            }
+        }
+    }
+    return RValue_makeReal((GMLReal) result);
+}
+
+// sprite_create_from_screen(x, y, w, h, removeback, smooth, xorig, yorig) and Undertale's
+// sprite_create_from_screen_x variant: the rect is in window pixels, i.e. the same space as
+// application_surface, so this is a capture of the application surface. Used by the lab
+// monitor (obj_labcamera), which grabs a 60x40 window-pixel crop around the player each frame.
+static RValue builtin_sprite_create_from_screen(VMContext* ctx, RValue* args, int32_t argCount) {
+    Runner* runner = ctx->runner;
+    if (argCount < 4 || runner->renderer == nullptr || runner->renderer->vtable->createSpriteFromSurface == nullptr) return RValue_makeReal(-1);
+    int32_t x = RValue_toInt32(args[0]);
+    int32_t y = RValue_toInt32(args[1]);
+    int32_t w = RValue_toInt32(args[2]);
+    int32_t h = RValue_toInt32(args[3]);
+    bool removeback = argCount > 4 && RValue_toBool(args[4]);
+    bool smooth = argCount > 5 && RValue_toBool(args[5]);
+    int32_t xorig = argCount > 6 ? RValue_toInt32(args[6]) : 0;
+    int32_t yorig = argCount > 7 ? RValue_toInt32(args[7]) : 0;
+    int32_t result = runner->renderer->vtable->createSpriteFromSurface(runner->renderer, APPLICATION_SURFACE_ID, x, y, w, h, removeback, smooth, xorig, yorig);
     return RValue_makeReal((GMLReal) result);
 }
 
@@ -25507,6 +25558,7 @@ void VMBuiltins_registerAll(VMContext* ctx) {
     VM_registerBuiltin(ctx, "sprite_set_bbox", builtin_sprite_set_bbox);
     VM_registerBuiltin(ctx, "sprite_set_offset", builtin_sprite_set_offset);
     VM_registerBuiltin(ctx, "sprite_create_from_surface", builtin_sprite_create_from_surface);
+    VM_registerBuiltin(ctx, "sprite_create_from_screen", builtin_sprite_create_from_screen);
     VM_registerBuiltin(ctx, "sprite_delete", builtin_sprite_delete);
 
     // Text measurement
