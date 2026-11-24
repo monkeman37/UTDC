@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 project(utdc_builder C RC)
 
-set(UTDC_VERSION "0.1.1" CACHE STRING "Version string")
+set(UTDC_VERSION "0.1.2" CACHE STRING "Version string")
 set(UTDC_PAYLOAD_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../runner/build-dc" CACHE PATH "Folder with 1ST_READ.BIN and IP.BIN")
 
 set(CMAKE_C_STANDARD 99)

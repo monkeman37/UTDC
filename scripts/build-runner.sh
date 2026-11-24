@@ -15,5 +15,5 @@ sh-elf-objcopy -R .stack -O binary "$BUILD/butterscotch.elf" "$BUILD/1ST_READ.BI
 MAKEIP="$KOS_BASE/utils/makeip/src/makeip"
 [ -x "$MAKEIP" ] || make -C "$KOS_BASE/utils/makeip/src"
 rm -f "$BUILD/IP.BIN"
-"$MAKEIP" -g "UNDERTALE DC (UTDC)" -c "UTDC" -n "T-UTDC1" -e "V0.110" -i "GD-ROM1/1" -p "E000F10" -a "JUE" "$BUILD/IP.BIN" >/dev/null
+"$MAKEIP" -g "UNDERTALE DC (UTDC)" -c "UTDC" -n "T-UTDC1" -e "V0.120" -i "GD-ROM1/1" -p "E000F10" -a "JUE" "$BUILD/IP.BIN" >/dev/null
 ls -l "$BUILD/1ST_READ.BIN" "$BUILD/IP.BIN"
